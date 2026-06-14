@@ -84,19 +84,14 @@ channels stay decorrelated. A speaker is never fed the reverb of its own signal.
 * **3D Reverb Environment** — when on (default), reverb is the
   60 % adjacent / 40 %-by-distance mix described above; off feeds each speaker
   reverb from its single nearest neighbour only.
-* **3D Immersive** *(default off)* — a separate pathway built on the analyzer
-  above. It steers detected overhead content into the height layer **and**, as it
-  rises, **ducks the ear-level bed** — front L/R and every surround — by up to
-  **`max bed duck` (default 11 dB)**. The duck is driven by a deliberately
-  **slow, sustained** measure of the **diffuse / ambient** energy actually present
+* **3D Immersive** *(default off)* — steers detected overhead content into the height layer
+* **and**, as it rises, **ducks the ear-level bed** — front L/R and every surround — by 2db. T
+* he duck is driven by a sustained measure of the **diffuse / ambient** energy actually present
   — wind, storm, the recording's **natural reflections**, an **ambient-music**
   wash, a helicopter's rotor wash — with a gentle multi-second attack and release,
-  so it only swells in and recedes (never fast or pumping). It **explicitly
-  ignores brief transients and dry, coherent content**: isolated object hits,
-  dialogue and dry music produce **no duck** at all. The **centre (dialogue) and
+  so it only swells in and recedes (never fast or pumping). The **centre (dialogue) and
   LFE are left at full level**, so voices and low end stay anchored while the
-  atmosphere lifts overhead. *This intentionally moves energy off the bed, so
-  unlike the other modes the bed is no longer bit-exact while it is engaged.*
+  atmosphere lifts overhead. 
 * **Dolby Pro Logic decode** — auto-detected; see below.
 
 **Dolby Pro Logic / Surround:** every stereo source is analysed for matrix
@@ -121,7 +116,7 @@ python ascend_cli.py *.flac --preset Large           :: batch, auto-named
 ## How it works (the DSP, honestly)
 
 Ascend uses a single **reverb-send** engine for every preset (Small / Medium /
-Large / **Movie** / Speech), mirroring the Auro-Matic philosophy — keep the
+Large / **Movie** / Speech), mirroring the philosophy of Upmixers like the Auro-Matic by Auro3D — keep the
 original channels intact and **add** a synthesised 3D environment.
 
 **Movie is a cinema model built on measured theatre acoustics.** Its reverb
@@ -133,24 +128,6 @@ bass), and the **highs absorbed faster** (~0.85 s at 2 kHz down to ~0.55 s at
 built from a flat-summing octave-band filterbank that decays each band by its
 measured RT60.
 
-It is voiced as a **THX-style acoustically-treated auditorium**:
-
-* **Slightly lowered treble** — a gentle high-shelf rolloff on the reverb
-  (`reverb_hf_db`), modelling the absorptive wall treatment and air absorption
-  that keep a THX room from sounding bright or harsh.
-* **Absorptive rear wall** — the screen channels' reflected energy is largely
-  absorbed rather than bounced back into the seating, so the front speakers
-  contribute **less reverb to the rear/back** layer (`front_rear_absorb`).
-* **Absorptive sidewalls (to ear level)** — sidewall reflections are damped, so
-  the **side surrounds carry less reverb** (`side_absorb_db`).
-* **Room geometry → reverb timing** — the speakers sit at real cinema distances
-  (front ≈ 12 m, sides ≈ 13 m, rears ≈ 6 m, heights ≈ 11 m above), so each
-  layer's room energy arrives with a **distance-based pre-delay** (`geo_predelay`,
-  using the speed of sound): the near rears first, then the heights, fronts and
-  the far sidewalls last.
-* Early reflections are pushed past ~20 ms (cinemas suppress them; the field is
-  diffuse), and the wet field is trimmed ~3 dB at full strength. (A stricter
-  ISO 2969 / SMPTE 202M "X-curve" tail is also available in the engine.)
 
 ### The reverb-send engine
 
