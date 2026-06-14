@@ -50,7 +50,7 @@ or on Windows `.venv\Scripts\pythonw ascend_gui.py`.)
    phase-difference height sources, rear-height front mix, Pro Logic decode).
 4. **Upmix** → writes a float32 multichannel WAV next to the source.
 
-### Strength adds reverb to a dry direct signal (0–16)
+### Strength slider usage (0–16)
 
 Every synthesised speaker (surround **and** height) carries its own **dry direct
 signal plus room reverb** of the speakers around it. Strength sets how much
