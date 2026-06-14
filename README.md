@@ -57,25 +57,18 @@ signal plus room reverb** of the speakers around it. Strength sets how much
 reverb is added on top of the always-present dry direct:
 
 * **0** — the surround/height channels are a **pure dry field**: no reverb, no
-  reflections, and **no tonal shaping of any kind** (the ceiling-darkening and
-  room-treble shelves belong to the reverb, so they are applied to the wet
-  signal only). Each channel is a flat, decorrelated copy of its source built
-  from a cascade of **Schroeder all-pass sections** — a *true* all-pass, so its
-  magnitude response is flat to **~0.01 dB**: it scrambles phase to widen the
-  image but leaves the **tone completely uncoloured** (measured flat across
-  80 Hz–16 kHz). The **phase-difference height
+  reflections, and **no tonal shaping of any kind** Each channel is a flat, decorrelated
+  copy of its source built from a cascade of **Schroeder all-pass sections**
+  — a *true* all-pass, so its magnitude response is flat to **~0.01 dB**:
+  it scrambles phase to widen the image but leaves the **tone completely uncoloured**
+  (measured flat across 80 Hz–16 kHz). The **phase-difference height
   sources are still applied** at 0 (see below); they're simply dry.
 * **16** — the dry direct **plus the full proximity reverb + reflections**.
 * In between, the reverb is added in proportion (e.g. strength 8 ≈ dry + half
   reverb). The dry direct is never removed — strength only adds room.
 * The recommended strength is 9 for Small/Medium/Large, and 4 for Movie Mode.
 
-**Proximity reverb.** The reverb a speaker receives is sourced by position: it
-gets **~60 % from the nearest speaker below/adjacent** (e.g. *Height Front Left*
-← *Front Left*, a back height ← the surround beneath it) and the remaining
-**~40 % shared among the rest, weighted by distance** — the further a speaker is,
-the less reverb it contributes. Each output uses its own room kernel, so the
-channels stay decorrelated. A speaker is never fed the reverb of its own signal.
+
 
 **Options**
 * **Widening** — pushes the steered layer correlations to full independence
@@ -83,14 +76,11 @@ channels stay decorrelated. A speaker is never fed the reverb of its own signal.
   decorrelation by default; Movie is fully decorrelated).
 * **3D Reverb Environment** — when on (default), reverb is the
   60 % adjacent / 40 %-by-distance mix described above; off feeds each speaker
-  reverb from its single nearest neighbour only.
-* **3D Immersive** *(default off)* — steers detected overhead content into the height layer
-* **and**, as it rises, **ducks the ear-level bed** — front L/R and every surround — by 2db. T
-* he duck is driven by a sustained measure of the **diffuse / ambient** energy actually present
-  — wind, storm, the recording's **natural reflections**, an **ambient-music**
-  wash, a helicopter's rotor wash — with a gentle multi-second attack and release,
-  so it only swells in and recedes (never fast or pumping). The **centre (dialogue) and
-  LFE are left at full level**, so voices and low end stay anchored while the
+  reverb from its single nearest neighbour only, for a realistic reverb behaviour.
+* **3D Immersive** *(default off)* — steers detected overhead content into the height layer, and, as it rises, **ducks the ear-level bed** — front L/R and every surround — by 2db. T
+  the duck is driven by a sustained measure of the **diffuse / ambient** energy actually present
+  — sounds like wind, storm, overhead objects like helicopters, the recording's **natural reflections**, an **ambient-music**.
+  The **centre (dialogue) and LFE are left at full level**, so voices and low end stay anchored while the
   atmosphere lifts overhead. 
 * **Dolby Pro Logic decode** — auto-detected; see below.
 
