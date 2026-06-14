@@ -1,15 +1,8 @@
 # Ascend — 3D Height Upmixer (Windows / macOS)
 
-An **independent, original** implementation of an *Auro-Matic-style* upmixer.
-It converts mono / stereo / 5.1 / 7.1 audio into a layered 3D format with
-synthesised **height** channels (Auro 9.1 / 10.1 / 11.1, 5.1.4, 7.1.4).
-
-> This is **not** Auro Technologies' proprietary code and is not affiliated
-> with them. The real Auro-Matic internals are not public. Ascend is built
-> entirely from openly documented DSP techniques (see *How it works*).
-
----
-
+An Upmixer that converts mono / stereo / 5.1 / 7.1 audio into a layered 3D format 
+with synthesised **height** channels (Auro 9.1 / 10.1 / 11.1, 5.1.4, 7.1.4).
+-
 ## Install
 
 Ascend installs the same way on **Windows, macOS and Linux**. Unzip the folder,
