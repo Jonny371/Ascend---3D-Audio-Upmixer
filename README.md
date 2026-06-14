@@ -78,60 +78,12 @@ the less reverb it contributes. Each output uses its own room kernel, so the
 channels stay decorrelated. A speaker is never fed the reverb of its own signal.
 
 **Options**
-* **Decorrelate** — pushes the steered layer correlations to full independence
+* **Widening** — pushes the steered layer correlations to full independence
   for the widest, most diffuse field (Small/Medium/Large carry 50 %
   decorrelation by default; Movie is fully decorrelated).
-* **Spread reverb across nearby speakers** — when on (default), reverb is the
+* **3D Reverb Environment** — when on (default), reverb is the
   60 % adjacent / 40 %-by-distance mix described above; off feeds each speaker
   reverb from its single nearest neighbour only.
-* **Pure upmix — no reverb / reflections** *(default off)* — outputs **just the
-  dry spatial redistribution**: the intact bed plus the surround and height layers,
-  with **no proximity reverb, no front/centre reflection send and no LFE bloom**.
-  It is the strength-0 field forced on regardless of the strength slider (the
-  slider is greyed out while it's active). In this mode the surround/height field
-  also drops **all synthetic decorrelation** (the short all-pass that, while
-  flat, is technically a set of early reflections), so the heights carry **no
-  reflections of any kind**. For **mono / stereo** sources the surround + height
-  layer is built from the **recording's own extracted ambience** (the diffuse
-  component of the stereo image), placed at its **natural level a fair bit below
-  the front** (rather than normalised up to the front level, which made the
-  separated content too loud and harsh) — so a dry mono source keeps its
-  surrounds/heights silent, as it has no ambience to extract. Multichannel sources
-  keep their discrete surrounds/heights, just without the decorrelation — and the
-  overhead layer is built from the **direct (primary) component** of the front and
-  surround channels rather than the raw channels, so the heights don't inherit the
-  mix's baked-in surround reverb. A generated rear zone (e.g. stereo→7.1, or the
-  back pair of a 5.1→7.1.4) is given a static, reflection-free rotation so it is
-  **not identical** to the side it is derived from.
-* **Phase-difference height source** — see *How it works* step 3.
-* **Dynamics follow** *(default on)* — the synthesised field (reverb, ambience,
-  generated surrounds and heights) is reshaped so its loudness contour tracks the
-  **original mix**: where the source dips, the reverb tail is pulled down with it;
-  where it swells, the field rises. The gain is recentred to a synth-energy-
-  weighted unit mean, so the field's overall level is preserved and only its
-  *contour over time* changes — the upmix breathes with the source instead of
-  smearing it with a constant wash. The **bed stays bit-exact**; only non-bed
-  channels are touched, and only at strength > 0. `dyn_amount` (0–1) sets how far
-  it follows — the default (0.4) is a gentle nudge rather than a hard envelope
-  match.
-* **Steer atmosphere / objects to heights** *(default off)* — an internal,
-  heuristic content analyzer (no trained model) that detects **rain, wind, storm,
-  helicopters and isolated transient objects** and lifts them into the height
-  layer. It uses purely spectral / spatial cues: diffuse (low inter-channel
-  coherence) **and** noise-like (high spectral-flatness) energy for rain / wind /
-  storm; a periodic low-frequency rotor modulation (6–45 Hz, by envelope
-  modulation-spectrum) for helicopters; and for isolated objects, **brief,
-  spectrally-compact, off-centre transients** — found with an adaptive onset
-  detector (a rise above the recent level, so steady ambience never counts) gated
-  by spectral compactness (a high crest factor, so broadband wash like rain/wind
-  is excluded). Tonal, centred, correlated content (dialogue, music)
-  scores low and is left in place. The detected content drives a **time-varying,
-  level-neutral crossfade**: when overhead content is present, each height channel
-  morphs toward it; when nothing is detected the heights are untouched. Because it
-  crossfades rather than adds, the height layer still obeys the front/surround
-  average level and the bed is never touched. `steer_amount` (0–1) sets how
-  strongly the heights morph toward the detected content. *This is a creative,
-  heuristic effect — detection is approximate, so it is opt-in.*
 * **3D Immersive** *(default off)* — a separate pathway built on the analyzer
   above. It steers detected overhead content into the height layer **and**, as it
   rises, **ducks the ear-level bed** — front L/R and every surround — by up to
