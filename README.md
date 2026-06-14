@@ -68,6 +68,7 @@ reverb is added on top of the always-present dry direct:
 * **16** — the dry direct **plus the full proximity reverb + reflections**.
 * In between, the reverb is added in proportion (e.g. strength 8 ≈ dry + half
   reverb). The dry direct is never removed — strength only adds room.
+* The recommended strength is 9 for Small/Medium/Large, and 4 for Movie Mode.
 
 **Proximity reverb.** The reverb a speaker receives is sourced by position: it
 gets **~60 % from the nearest speaker below/adjacent** (e.g. *Height Front Left*
