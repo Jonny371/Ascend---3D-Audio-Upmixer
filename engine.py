@@ -1429,7 +1429,7 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
     # separated content loud and harsh).  So in pure-ambience mode these use a
     # direct gain instead of the RMS-normalising scale_pair, and the height
     # levelling is skipped.
-    AMB_MAKEUP = 1.3
+    AMB_MAKEUP = 1.365   # stereo/mono pure-ambience makeup (5% stronger than 1.30)
     # The extracted ambience is spread across every surround + height speaker, so
     # the SUMMED diffuse energy would otherwise grow with the channel count and
     # start to drown the front (e.g. 9.1.6 put ~12 diffuse channels nearly level
@@ -1832,8 +1832,22 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
     # field down so the front always leads.  Discrete multichannel content is
     # never touched, and the field is only ever reduced, never boosted — so the
     # faithful pure-ambience level (already well below the front) is left alone.
-    DIFFUSE_CEIL_DB = -9.0
+    # FRONT-DOMINANCE CEILING.
+    # The surround + height layer is spread over many speakers, so its SUMMED
+    # energy can collectively overpower the front anchor and make the original
+    # front "drown" — worst with reverb on, in big layouts, and when a discrete
+    # surround pair is fanned out across four+ positions.  If that summed energy
+    # rises above a set margin below the front pair, scale the field down so the
+    # front always leads.  Applied to synthesised (mono/stereo) fields in either
+    # mode, and to PURE surround→immersive conversions; normal-mode multichannel
+    # keeps its discrete surrounds untouched.  Only ever reduces, never boosts —
+    # so the faithful pure-ambience level (already below the front) is left alone.
+    ceil_db = None
     if not in_zones:
+        ceil_db = -9.0          # synthesised field from a mono/stereo source
+    elif no_reverb:
+        ceil_db = -6.0          # surround → immersive, PURE: keep front clearly on top
+    if ceil_db is not None:
         _front_excl = {"FL", "FR", "FC", "LFE", "FLW", "FRW"}
         fr_i = [i for i in range(len(labels)) if keyof.get(labels[i]) in ("FL", "FR")]
         df_i = [i for i in range(len(labels)) if keyof.get(labels[i]) not in _front_excl]
@@ -1842,8 +1856,8 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
             dpow = float(np.sum(np.mean(M[:, df_i] ** 2, axis=0)))
             if fpow > 1e-12 and dpow > 1e-12:
                 ratio_db = 10.0 * np.log10(dpow / fpow)
-                if ratio_db > DIFFUSE_CEIL_DB:
-                    M[:, df_i] *= 10.0 ** ((DIFFUSE_CEIL_DB - ratio_db) / 20.0)
+                if ratio_db > ceil_db:
+                    M[:, df_i] *= 10.0 ** ((ceil_db - ratio_db) / 20.0)
 
     # 3D IMMERSIVE: as detected content is lifted overhead, duck the EAR-LEVEL bed
     # (front L/R + every surround, synthesised or discrete) by up to
