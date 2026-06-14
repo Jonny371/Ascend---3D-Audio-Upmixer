@@ -1,4 +1,4 @@
-# Ascend — 3D Height Upmixer (Windows / macOS)
+# Ascend - 3D Height Upmixer (Windows / macOS)
 
 An Audio Upmixer that converts mono / stereo / 5.1 / 7.1 audio into a layered 3D format 
 with synthesised **height** channels (Auro 9.1 / 10.1 / 11.1, 5.1.4, 7.1.4).
