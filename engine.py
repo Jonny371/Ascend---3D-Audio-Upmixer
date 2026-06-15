@@ -426,6 +426,31 @@ def primary_ambient_decompose(L, R, sr, diffuse_exp=1.0, smooth_ms=50.0):
     return pL[:n], pR[:n], aL[:n], aR[:n]
 
 
+def antiphase_common(L, R, sr, smooth_ms=40.0):
+    """Extract the component that is present in BOTH channels but phase-inverted
+    (L carries +x where R carries -x) — the genuine out-of-phase 'surround' signal
+    of a Dolby Surround / matrix encode.  Content that is in-phase (centre) or
+    only in one channel (hard-panned) is rejected: only anti-correlated common
+    energy is returned.  Done per time/frequency bin so it tracks the mix."""
+    nper = 4096; hop = nper // 4; win = "hann"
+    f, t, ZL = signal.stft(L, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+    _, _, ZR = signal.stft(R, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+    a = np.exp(-hop / (sr * smooth_ms * 1e-3))
+    bsm, asm = [1 - a], [1, -a]
+    Sll = signal.lfilter(bsm, asm, np.abs(ZL) ** 2, axis=1)
+    Srr = signal.lfilter(bsm, asm, np.abs(ZR) ** 2, axis=1)
+    Slr = signal.lfilter(bsm, asm, ZL * np.conj(ZR), axis=1)
+    # weight = how anti-phase the bin is: 1 when L = -R, 0 when in-phase or when
+    # one side is silent (panned).  -Re(cross)/(|L||R|) is the negated correlation.
+    w = np.clip(-np.real(Slr) / (np.sqrt(Sll * Srr) + 1e-9), 0.0, 1.0)
+    A = w * 0.5 * (ZL - ZR)
+    _, x = signal.istft(A, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+    n = min(len(L), len(x))
+    out = np.zeros(len(L))
+    out[:n] = x[:n]
+    return out
+
+
 def conv_same(x, k):
     return signal.fftconvolve(x, k, mode="full")[:len(x)]
 
@@ -1038,7 +1063,10 @@ def detect_prologic(audio, sr):
 
 def prologic_decode(audio, sr):
     """Passive Dolby Surround / Pro Logic decode of an Lt/Rt stereo pair to a
-    6-channel 5.1 array in WAV order (L R C LFE Ls Rs).  Surrounds are mono."""
+    6-channel 5.1 array in WAV order (L R C LFE Ls Rs).  The surround carries ONLY
+    the content that is on both channels but phase-inverted (the genuine matrix
+    surround); in-phase and hard-panned material stays in the fronts/centre.
+    Surrounds are mono (one matrixed S feeds both)."""
     if audio.ndim == 1:
         audio = audio[:, None]
     if audio.shape[1] == 1:
@@ -1047,25 +1075,22 @@ def prologic_decode(audio, sr):
     R = audio[:, 1].astype(np.float64)
     g = 0.353553                                   # -9 dB matrix coefficient
 
-    # surround = 0.3536*(R-L), Dolby delay + 100-7000 Hz band + 90deg phase
-    s = R - L
-    s = _delay(s, 13.0, sr)
-    s = _bw(s, 100.0, "high", sr)
-    s = _bw(s, 7000.0, "low", sr)
-    s = np.imag(signal.hilbert(s))                 # 90-degree phase shift
-    s = _bw(s, 24000.0, "low", sr)
-    S = g * s
+    # The surround = ONLY the anti-phase common component (present in both
+    # channels, inverted).  Keep deep bass out of the surround feed.
+    A = antiphase_common(L, R, sr)
+    Sa = _bw(A, 80.0, "high", sr)
+    S = g * Sa
 
+    # In-phase content -> centre; deep in-phase sum -> LFE.
     C = g * (L + R)
     C = _bw(C, 70.0, "high", sr)
     C = _bw(C, 20000.0, "low", sr)
-
     LFE = _bw(g * (L + R), 100.0, "low", sr)
 
-    # Passive decode: fronts keep their distinct L/R content (the surround
-    # bleeds through, as in classic Dolby Surround).  The surround channel is
-    # mono by design (a single matrixed S = R-L feeds both surround speakers).
-    Lo, Ro = 0.5 * L, 0.5 * R
+    # Fronts keep everything EXCEPT the anti-phase common part (so the out-of-phase
+    # surround material does not also play from the fronts): L carries +A, R -A.
+    Lo = 0.5 * (L - A)
+    Ro = 0.5 * (R + A)
     out = np.stack([Lo, Ro, C, LFE, S, S], axis=1)   # L R C LFE Ls Rs
     return out.astype(np.float32)
 
@@ -1408,6 +1433,14 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
     src_lbl, src_sig = ["FL", "FR"], [L, R]
     if in_C is not None:
         src_lbl.append("FC"); src_sig.append(in_C[:n])
+    if prologic:
+        # Pro Logic: the surround/height REVERB must also come only from the
+        # anti-phase matrix surround, not the (in-phase/panned) fronts — otherwise
+        # front content leaks up into the surrounds/heights via the room.
+        _bz = in_zones.get("rear", in_zones.get("side"))
+        if _bz is not None:
+            _a = 0.5 * (_bz[0][:n] + _bz[1][:n])
+            src_lbl, src_sig = ["FL", "FR"], [_a, _a]
 
     PROX_SEED = {"FL": 101, "FR": 202, "FC": 1616, "BL": 303, "BR": 404,
                  "SL": 505, "SR": 606, "TFL": 707, "TFR": 808, "TFC": 1313,
@@ -1488,6 +1521,10 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
         source pan, then shaped by the room (THX absorption / treble / geometry)."""
         wts = proximity_weights(out_label, src_lbl, prox_near, prox_power)
         zone = SPK_ZONE.get(out_label)
+        if SPK_POS.get(out_label, (0.0, 0.0))[1] > 0:
+            # Height speaker: keep the CENTRE channel's reverb out of the overhead
+            # layer (its dialogue/score reverb was bleeding up into the heights).
+            wts = [0.0 if src_lbl[i] == "FC" else wi for i, wi in enumerate(wts)]
         if fr_absorb < 1.0 and zone == "rear":
             # THX rear wall: the screen channels' energy is absorbed, not
             # reflected back into the seating, so down-weight the front sources.
@@ -1582,20 +1619,23 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
             out[pos["TFR"]] = in_heights["TFR"] + w * _hshelf(rvR)
             passthru_keys |= {"TFL", "TFR"}
         else:
-            if pure_amb:
-                dryl, dryr = ambL, ambR
-            elif no_reverb:
-                # PURE, discrete-surround input: build the height from the DIRECT
-                # (primary) front content, minus the surround's DIRECT part — never
-                # the raw channels, which carry the mix's baked-in reverb.
-                if pd > 0 and in_zones and spri_L is not None:
-                    hsrcL, hsrcR = pL[:n] - pd * spri_L, pR[:n] - pd * spri_R
-                else:
-                    hsrcL, hsrcR = pL[:n], pR[:n]
-                dryl, dryr = hsrcL, hsrcR
+            if prologic and in_zones:
+                # Pro Logic: the heights carry ONLY the matrixed anti-phase
+                # surround (the same out-of-phase content as the surrounds), not
+                # the in-phase / hard-panned front material.
+                bz = in_zones.get("rear", in_zones.get("side"))
+                a_src = 0.5 * (bz[0][:n] + bz[1][:n])
+                dryl, dryr = (a_src, a_src) if no_reverb else decorr2(a_src, a_src, 9003, 9004)
             else:
+                # FRONT-minus-SURROUND phase subtraction (time domain) — the height
+                # principle.  The SAME dry source in normal and PURE mode; pure
+                # simply omits the reverb send below (w = 0), so the heights stay
+                # reflection-free while still built on the phase-subtraction
+                # principle.  (Time-domain subtraction, not an STFT primary/ambient
+                # extraction, so there is no spectral smearing that reads as room
+                # reflections.)  Mono/stereo, no surround zone: the decorrelated bed.
                 if pd > 0 and in_zones:
-                    sub = in_zones.get("rear", in_zones.get("side"))   # Ls/Rs (primary)
+                    sub = in_zones.get("rear", in_zones.get("side"))   # Ls/Rs
                     hsrcL, hsrcR = L - pd * sub[0][:n], R - pd * sub[1][:n]
                 else:
                     hsrcL, hsrcR = L, R
@@ -1618,27 +1658,20 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
             out[pos["TBR"]] = in_heights["TBR"] + w * _hshelf(rvR)
             passthru_keys |= {"TBL", "TBR"}
         else:
-            if pure_amb:
-                dryl, dryr = ambL, ambR
-            elif no_reverb:
-                # PURE: the surround's DIRECT (primary) component only, so the
-                # overhead-rear carries the dry sound, not the surround reverb.
-                if in_zones and spri_L is not None:
-                    asL, asR = spri_L.copy(), spri_R.copy()
-                else:
-                    asL, asR = pL[:n], pR[:n]
-                dryl, dryr = asL, asR
+            # Surround(-minus-side) phase subtraction, time domain — the same dry
+            # source in normal and PURE mode (pure omits the reverb send below).
+            # In Pro Logic the surround zone is the anti-phase signal, so this stays
+            # anti-phase too.  No STFT primary/ambient extraction => no smearing.
+            if in_zones:
+                bz = in_zones.get("rear", in_zones.get("side"))
+                asL, asR = bz[0][:n].copy(), bz[1][:n].copy()
+                if pd > 0 and "rear" in in_zones and "side" in in_zones:
+                    sz = in_zones["side"]
+                    asL = asL - pd * sz[0][:n]
+                    asR = asR - pd * sz[1][:n]
             else:
-                if in_zones:
-                    bz = in_zones.get("rear", in_zones.get("side"))
-                    asL, asR = bz[0][:n].copy(), bz[1][:n].copy()
-                    if pd > 0 and "rear" in in_zones and "side" in in_zones:
-                        sz = in_zones["side"]
-                        asL = asL - pd * sz[0][:n]
-                        asR = asR - pd * sz[1][:n]
-                else:
-                    asL, asR = L, R
-                dryl, dryr = decorr2(asL, asR, 9005, 9006)
+                asL, asR = L, R
+            dryl, dryr = decorr2(asL, asR, 9005, 9006)
             dl, dr = place(dryl, dryr, rear_ratio * hs)
             rvL, rvR = scale_pair(prox_reverb("TBL"), prox_reverb("TBR"),
                                   rear_ratio * hs)
@@ -1661,32 +1694,22 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
                 fL = in_heights.get("TFL", L); bL = in_heights.get("TBL", L)
                 fR = in_heights.get("TFR", R); bR = in_heights.get("TBR", R)
             else:
-                # derive from the same phase-diff sources the heights use
-                if no_reverb and in_zones and spri_L is not None:
-                    # PURE: direct (primary) content only — no inherited reverb
-                    fL = pL[:n] - pd * spri_L if pd > 0 else pL[:n]
-                    fR = pR[:n] - pd * spri_R if pd > 0 else pR[:n]
-                    bL, bR = spri_L, spri_R
+                # derive from the same dry, time-domain phase-diff sources the
+                # front/rear heights use (no STFT primary extraction => no smearing)
+                if pd > 0 and in_zones:
+                    sub = in_zones.get("rear", in_zones.get("side"))
+                    fL, fR = L - pd * sub[0][:n], R - pd * sub[1][:n]
                 else:
-                    if pd > 0 and in_zones:
-                        sub = in_zones.get("rear", in_zones.get("side"))
-                        fL, fR = L - pd * sub[0][:n], R - pd * sub[1][:n]
-                    else:
-                        fL, fR = L, R
-                    if in_zones:
-                        bz = in_zones.get("rear", in_zones.get("side"))
-                        bL, bR = bz[0][:n], bz[1][:n]
-                    else:
-                        bL, bR = L, R
+                    fL, fR = L, R
+                if in_zones:
+                    bz = in_zones.get("rear", in_zones.get("side"))
+                    bL, bR = bz[0][:n], bz[1][:n]
+                else:
+                    bL, bR = L, R
             mL = 0.5 * (fL + bL); mR = 0.5 * (fR + bR)   # between the two rows
             mcoh = pd * 0.5 * (mL + mR)
             mL = mL - mcoh; mR = mR - mcoh               # phase-sub coherent part
-            if pure_amb:
-                dryl, dryr = ambL, ambR
-            elif no_reverb:
-                dryl, dryr = mL, mR
-            else:
-                dryl, dryr = slight_decorr2(mL, mR, 9015, 9016)
+            dryl, dryr = (mL, mR) if no_reverb else slight_decorr2(mL, mR, 9015, 9016)
             dl, dr = place(dryl, dryr, p["height_gain"] * hs)
             rvL, rvR = scale_pair(prox_reverb("TSL"), prox_reverb("TSR"),
                                   p["height_gain"] * hs)
@@ -1706,22 +1729,12 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
             out[pos["TC"]] = coh + w * rbj_high_shelf(rv, sr, 5500, -(tilt + 1.5))
             passthru_keys.add("TC")
         else:
-            if pure_amb:
-                src = 0.5 * (ambL + ambR)
-            elif no_reverb:
-                src = 0.5 * (L + R)
-            else:
-                src = dap(0.5 * (L + R), 9009)
+            src = 0.5 * (L + R) if no_reverb else dap(0.5 * (L + R), 9009)
             dry = place_mono(src, p["height_gain"] * 0.6 * hs)
             rv = scale_mono(prox_reverb("TC"), p["height_gain"] * 0.6 * hs)
             out[pos["TC"]] = dry + w * rbj_high_shelf(rv, sr, 5500, -(tilt + 1.5))
     if "TFC" in pos:                      # centre height (Auro 11.1)
-        if pure_amb:
-            src = 0.5 * (ambL + ambR)
-        elif no_reverb:
-            src = 0.5 * (pL + pR)
-        else:
-            src = dap(0.5 * (pL + pR), 9010)
+        src = 0.5 * (L + R) if no_reverb else dap(0.5 * (L + R), 9010)
         dry = place_mono(src, p["height_gain"] * 0.45 * hs)
         rv = scale_mono(prox_reverb("TFC"), p["height_gain"] * 0.45 * hs)
         out[pos["TFC"]] = dry + w * rbj_high_shelf(rv, sr, 6000, -(tilt + 1.0))
@@ -1806,51 +1819,25 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
         g = g[:n]
         M[:, synth_i] *= g[:, None]
 
-    # Height levelling (synthesised heights only; discrete passthrough heights
-    # keep their level).  Front heights sit at the FRONT level; rear/side/overhead
-    # heights sit BETWEEN the front and surround levels.  Each row is scaled by its
-    # own factor, preserving the internal balance within the row.
-    fpk = gpk(front_i); spk = gpk(surr_i)
-    fronth_keys = {"TFL", "TFR", "TFC"}
-    fronth_i = [i for i in height_i if keyof.get(labels[i]) in fronth_keys]
-    rearh_i = [i for i in height_i if keyof.get(labels[i]) not in fronth_keys]
-
-    def _level(idx, target):
-        ph = gpk(idx)
-        if idx and ph > 1e-9 and target > 1e-9:
-            M[:, idx] *= target / ph
-    if not pure_amb:                            # pure-ambience keeps its NATURAL level
-        _level(fronth_i, fpk)                   # front heights == front level
-        _level(rearh_i, 0.5 * (fpk + spk))      # rear/side heights between front & surround
-
-    # FRONT-DOMINANCE CEILING (synthesised field only — stereo/mono sources).
-    # The surround + height layer is spread over many speakers, so its SUMMED
-    # energy can collectively overpower the front anchor and make the original
-    # front "drown" — worst with reverb on and in big layouts (9.1.6 put the
-    # diffuse field roughly level with the front pair).  If that summed energy
-    # rises above a set margin below the front pair, scale the WHOLE synthesised
-    # field down so the front always leads.  Discrete multichannel content is
-    # never touched, and the field is only ever reduced, never boosted — so the
-    # faithful pure-ambience level (already well below the front) is left alone.
-    # FRONT-DOMINANCE CEILING.
-    # The surround + height layer is spread over many speakers, so its SUMMED
-    # energy can collectively overpower the front anchor and make the original
-    # front "drown" — worst with reverb on, in big layouts, and when a discrete
-    # surround pair is fanned out across four+ positions.  If that summed energy
-    # rises above a set margin below the front pair, scale the field down so the
-    # front always leads.  Applied to synthesised (mono/stereo) fields in either
-    # mode, and to PURE surround→immersive conversions; normal-mode multichannel
-    # keeps its discrete surrounds untouched.  Only ever reduces, never boosts —
-    # so the faithful pure-ambience level (already below the front) is left alone.
+    # FRONT-DOMINANCE CEILING (ear-level surround field only — heights are levelled
+    # explicitly below and are exempt here).  A surround field spread over many
+    # speakers can collectively overpower the front anchor and make the original
+    # front "drown".  If the summed ear-level surround energy rises above a set
+    # margin below the front pair, scale the surrounds down so the front leads.
+    # Applied to synthesised (mono/stereo) fields in either mode and to PURE
+    # surround→immersive; normal-mode multichannel keeps its discrete surrounds.
+    # Only ever reduces, never boosts.
     ceil_db = None
     if not in_zones:
         ceil_db = -9.0          # synthesised field from a mono/stereo source
     elif no_reverb:
         ceil_db = -6.0          # surround → immersive, PURE: keep front clearly on top
     if ceil_db is not None:
-        _front_excl = {"FL", "FR", "FC", "LFE", "FLW", "FRW"}
+        _excl = {"FL", "FR", "FC", "LFE", "FLW", "FRW"}
         fr_i = [i for i in range(len(labels)) if keyof.get(labels[i]) in ("FL", "FR")]
-        df_i = [i for i in range(len(labels)) if keyof.get(labels[i]) not in _front_excl]
+        df_i = [i for i in range(len(labels))
+                if keyof.get(labels[i]) not in _excl
+                and not str(keyof.get(labels[i], "")).startswith("T")]   # not heights
         if fr_i and df_i:
             fpow = float(np.sum(np.mean(M[:, fr_i] ** 2, axis=0)))
             dpow = float(np.sum(np.mean(M[:, df_i] ** 2, axis=0)))
@@ -1858,6 +1845,93 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
                 ratio_db = 10.0 * np.log10(dpow / fpow)
                 if ratio_db > ceil_db:
                     M[:, df_i] *= 10.0 ** ((ceil_db - ratio_db) / 20.0)
+
+    fronth_keys = {"TFL", "TFR", "TFC"}
+    fronth_i = [i for i in height_i if keyof.get(labels[i]) in fronth_keys]
+    rearh_i = [i for i in height_i if keyof.get(labels[i]) not in fronth_keys]
+    lr_i = idx_of({"FL", "FR"})
+    sur_i = idx_of({"BL", "BR", "SL", "SR"})
+
+    # SMOOTH HEIGHT SWING-LIMITER.  With reverb the height tail keeps the field
+    # continuous, but a PURE / Pro Logic dry extraction collapses whenever the
+    # diffuse/anti-phase content it feeds on thins out — the height level then
+    # swings tens of dB against the bed and "chops"/jumps.
+    #
+    # (1) PURE mode: give the height field a continuous floor so it never gates to
+    #     silence — but REFLECTION-FREE.  A convolved/diffuse floor smears in time
+    #     and reads as room reflections, which pure mode must not have.  Instead use
+    #     the bed's own high-passed L/R with a partial side-matrix (subtract part of
+    #     the opposite channel) — a pure linear mix, no tail — which keeps the floor
+    #     continuous while pulling down the centre (dialogue) content.  Not used in
+    #     Pro Logic (heights stay anti-phase only) nor normal mode (already smooth).
+    if no_reverb and not prologic and height_i and strength > 0 and lr_i:
+        _L = M[:, lr_i[0]].astype(np.float64); _R = M[:, lr_i[1]].astype(np.float64)
+        _hb, _ha = signal.butter(2, 450.0 / (sr / 2), "high")
+        _fl = signal.filtfilt(_hb, _ha, _L - 0.4 * _R)        # left, centre reduced
+        _fr = signal.filtfilt(_hb, _ha, _R - 0.4 * _L)        # right, centre reduced
+        _fc = 0.5 * (_fl + _fr)
+        floors = {}
+        for i in height_i:
+            az = SPK_POS.get(keyof.get(labels[i], ""), (0.0, 0.0))[0]
+            floors[i] = _fl if az < -5 else (_fr if az > 5 else _fc)
+        fl_rms = np.sqrt(np.mean(np.stack([floors[i] for i in height_i]) ** 2)) + 1e-12
+        h_rms = float(np.sqrt(np.mean(M[:, height_i] ** 2))) + 1e-12
+        k = 0.7 * h_rms / fl_rms
+        for i in height_i:
+            M[:, i] += (k * floors[i][:n]).astype(M.dtype)
+
+    # (2) Hold the height field within a smoothly-varying band around the bed so
+    #     its level glides instead of gating.  The band is wide enough that a
+    #     normal (reverb) upmix — already smooth — passes through untouched.
+    if height_i and strength > 0:
+        def _slow_env(x, ms):
+            aa = np.exp(-1.0 / (sr * ms * 1e-3))
+            e = signal.lfilter([1 - aa], [1.0, -aa], np.abs(x).astype(np.float64))
+            e = signal.lfilter([1 - aa], [1.0, -aa], e[::-1])[::-1]   # zero-phase
+            return e + 1e-9
+        bed_ref = lr_i if lr_i else fronth_i
+        eb = _slow_env(M[:, bed_ref].sum(axis=1), 120.0)
+        eh = _slow_env(M[:, height_i].sum(axis=1), 120.0)
+        r = eh / eb
+        lo, hi = 10.0 ** (-12.0 / 20.0), 10.0 ** (4.0 / 20.0)   # band vs bed
+        gain = np.clip(r, lo, hi) / r
+        gain = np.clip(gain, 10.0 ** (-24.0 / 20.0), 10.0 ** (12.0 / 20.0))
+        ag = np.exp(-1.0 / (sr * 120.0 * 1e-3))                 # de-zipper (zero-phase)
+        gain = signal.lfilter([1 - ag], [1.0, -ag], gain)
+        gain = signal.lfilter([1 - ag], [1.0, -ag], gain[::-1])[::-1]
+        M[:, height_i] *= gain[:n, None]
+
+    def _rms(idx):
+        return float(np.sqrt(np.mean(M[:, idx] ** 2))) if idx else 0.0
+
+    def _p99(idx):
+        return float(np.percentile(np.abs(M[:, idx]), 99.9)) if idx else 0.0
+
+    def _fit(idx, ref_rms, ref_pk):
+        # Match loudness (RMS) to the reference, THEN cap the peak so the height
+        # waveform is never taller than the reference's — heights read as "as loud
+        # as" the fronts/surrounds without ever sitting above them.
+        if not idx:
+            return
+        cur = _rms(idx)
+        if cur > 1e-9 and ref_rms > 1e-9:
+            M[:, idx] *= ref_rms / cur
+        p = _p99(idx)
+        if p > ref_pk > 1e-9:
+            M[:, idx] *= ref_pk / p
+
+    # Front heights track the FRONT (L/R); rear/side/overhead heights track the
+    # SURROUND.  Mono/stereo source (no real surround): ALL heights track the
+    # front.  RMS reference excludes the centre, so loud dialogue/score never
+    # inflates the heights.  Applied in EVERY mode (incl. pure) so the heights are
+    # always loudness-matched to the fronts, independent of preset/strength.
+    f_rms, f_pk = _rms(lr_i), _p99(lr_i)
+    if in_zones and sur_i:
+        s_rms, s_pk = _rms(sur_i), _p99(sur_i)
+    else:
+        s_rms, s_pk = f_rms, f_pk          # stereo: heights == fronts
+    _fit(fronth_i, f_rms, f_pk)
+    _fit(rearh_i, s_rms, s_pk)
 
     # 3D IMMERSIVE: as detected content is lifted overhead, duck the EAR-LEVEL bed
     # (front L/R + every surround, synthesised or discrete) by up to
