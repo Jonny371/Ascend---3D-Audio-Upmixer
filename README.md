@@ -111,10 +111,9 @@ The fronts are always the original mix, bit-for-bit. Reverb is no longer tied to
 the slider — it lives entirely in the **3D Reverb Environment** toggle.
 
 **2. The surround + height field is REDISTRIBUTED from the source, not added on
-top.** Following the energy-preserving spirit of parametric time-frequency
-upmixing (cf. Turner & Murphy, DAFx 2024), Movie mode does not pile a synthesised
-ambience/reverb over the original — which is what makes an upmix sound too strong
-and smears the image. Instead:
+top.** Following the energy-preserving of parametric time-frequency
+upmixing, Movie mode does not pile a synthesised
+ambience/reverb over the original. Instead:
 
 * **Coherence-driven extraction.** The diffuse ambience is pulled out by
   per-band, short-frame **inter-channel coherence** (0 = decorrelated/ambient …
@@ -152,21 +151,8 @@ enabled with any preset.
 * **Widening** — pushes the steered layer correlations to full independence
   for the widest, most diffuse field (Small/Medium/Large carry 50 %
   decorrelation by default; Movie is fully decorrelated).
-* **Dolby Pro Logic decode** — auto-detected; see below.
+* **Dolby Pro Logic decode** — auto-detected matrix-encoded sources.
 
-**Dolby Pro Logic / Surround:** every stereo source is analysed for matrix
-encoding (a surround signal hidden in the out-of-phase L−R component). If found,
-the **Dolby Pro Logic decode** box auto-ticks. In this mode the surrounds **and**
-the heights receive *only* the content that is present on both channels but
-phase-inverted — the genuine out-of-phase matrix surround. In-phase material
-(the centre) and hard-panned material stay in the fronts/centre and are kept out
-of the surrounds, heights and their reverb, so nothing but the out-of-phase signal
-is steered overhead and behind you. The anti-phase content is also removed from
-the fronts so it does not play from the front speakers as well. The extraction is
-done per time/frequency bin, so it tracks the mix rather than dumping the whole
-L−R difference (which would also carry panned content). Decorrelation is disabled
-in this mode (the recovered surround is a single mono signal). You can override
-the checkbox.
 
 The output is a `WAVE_FORMAT_EXTENSIBLE` file with a correct `dwChannelMask`,
 so editors / receivers read the speaker assignment automatically.
