@@ -1,8 +1,15 @@
-# Ascend - 3D Height Upmixer (Windows / macOS)
+# Ascend — 3D Height Upmixer (Windows / macOS)
 
-An Audio Upmixer that converts mono / stereo / 5.1 / 7.1 audio into a layered 3D format 
-with synthesised **height** channels (Auro 9.1 / 10.1 / 11.1, 5.1.4, 7.1.4).
--
+An **independent, original** implementation of an *Auro-Matic-style* upmixer.
+It converts mono / stereo / 5.1 / 7.1 audio into a layered 3D format with
+synthesised **height** channels (Auro 9.1 / 10.1 / 11.1, 5.1.4, 7.1.4).
+
+> This is **not** Auro Technologies' proprietary code and is not affiliated
+> with them. The real Auro-Matic internals are not public. Ascend is built
+> entirely from openly documented DSP techniques (see *How it works*).
+
+---
+
 ## Install
 
 Ascend installs the same way on **Windows, macOS and Linux**. Unzip the folder,
@@ -50,46 +57,186 @@ or on Windows `.venv\Scripts\pythonw ascend_gui.py`.)
    phase-difference height sources, rear-height front mix, Pro Logic decode).
 4. **Upmix** → writes a float32 multichannel WAV next to the source.
 
-### Strength slider usage (0–16)
+### Low-memory mode (long files)
 
-Every synthesised speaker (surround **and** height) carries its own **dry direct
-signal plus room reverb** of the speakers around it. Strength sets how much
-reverb is added on top of the always-present dry direct:
+The toggle in the **top-right corner** — **"Low-memory mode (segment long files)"**,
+on by default — lets Ascend process long material (roughly **8–120 minutes**)
+without running out of memory. Instead of holding the whole upmix in RAM, it
+processes the file in **6-minute segments** and streams each one straight to the
+output file, so peak memory is set by a single segment rather than the entire
+movie.
+
+The segments are not simply butt-joined: each one is processed with a few seconds
+of **overlap** that both pre-warms its reverb/decorrelation state and is used to
+**cross-fade the seam** with its neighbour, so the joins are inaudible. The fade
+is chosen per channel — **equal-power** for the synthesised/decorrelated channels
+(so the spatial level doesn't dip through the blend) and **linear** for the
+coherent bed (so the passthrough channels stay sample-accurate across the seam).
+The strength-0 bed remains bit-exact end to end.
+
+Output longer than the 4 GB WAV limit (long multichannel files easily exceed it)
+is written automatically as **RF64**, which Audition, Reaper, ffmpeg and most
+modern tools read transparently. Short files are processed in one pass exactly as
+before. Turn the toggle **off** to force whole-file processing.
+
+### Strength adds reverb to a dry direct signal (0–16) — *Small / Medium / Large / Speech*
+
+For the room presets, every synthesised speaker (surround **and** height) carries
+its own **dry direct signal plus room reverb** of the speakers around it. Strength
+sets how much reverb is added on top of the always-present dry direct:
 
 * **0** — the surround/height channels are a **pure dry field**: no reverb, no
-  reflections, and **no tonal shaping of any kind** Each channel is a flat, decorrelated
-  copy of its source built from a cascade of **Schroeder all-pass sections**
-  — a *true* all-pass, so its magnitude response is flat to **~0.01 dB**:
-  it scrambles phase to widen the image but leaves the **tone completely uncoloured**
-  (measured flat across 80 Hz–16 kHz). The **phase-difference height
+  reflections, and **no tonal shaping of any kind** (the ceiling-darkening and
+  room-treble shelves belong to the reverb, so they are applied to the wet
+  signal only). Each channel is a flat, decorrelated copy of its source built
+  from a cascade of **Schroeder all-pass sections** — a *true* all-pass, so its
+  magnitude response is flat to **~0.01 dB**: it scrambles phase to widen the
+  image but leaves the **tone completely uncoloured** (measured flat across
+  80 Hz–16 kHz). The **phase-difference height
   sources are still applied** at 0 (see below); they're simply dry.
 * **16** — the dry direct **plus the full proximity reverb + reflections**.
 * In between, the reverb is added in proportion (e.g. strength 8 ≈ dry + half
   reverb). The dry direct is never removed — strength only adds room.
-* The recommended strength is 9 for Small/Medium/Large, and 4 for Movie Mode.
 
+**Proximity reverb.** The reverb a speaker receives is sourced by position: it
+gets **~60 % from the nearest speaker below/adjacent** (e.g. *Height Front Left*
+← *Front Left*, a back height ← the surround beneath it) and the remaining
+**~40 % shared among the rest, weighted by distance** — the further a speaker is,
+the less reverb it contributes. Each output uses its own room kernel, so the
+channels stay decorrelated. A speaker is never fed the reverb of its own signal.
 
+### Movie mode — the 3D microphone-array capture engine
+
+The **Movie** preset works differently from the room presets, in two ways.
+
+**1. Strength is the surround/height *mix*, not the reverb.** In Movie mode the
+slider sets **how much of the synthesised 3D field is blended in over the original
+mix** — **0 = the original mix untouched** (stereo stays stereo; a 5.1/7.1 source
+keeps its own surrounds, with no height layer added), **16 = the full 3D upmix**.
+The fronts are always the original mix, bit-for-bit. Reverb is no longer tied to
+the slider — it lives entirely in the **3D Reverb Environment** toggle.
+
+**2. The surround + height field is REDISTRIBUTED from the source, not added on
+top.** Following the energy-preserving spirit of parametric time-frequency
+upmixing (cf. Turner & Murphy, DAFx 2024), Movie mode does not pile a synthesised
+ambience/reverb over the original — which is what makes an upmix sound too strong
+and smears the image. Instead:
+
+* **Coherence-driven extraction.** The diffuse ambience is pulled out by
+  per-band, short-frame **inter-channel coherence** (0 = decorrelated/ambient …
+  1 = coherent/direct), so direct content is left alone and the bass (mono/room
+  modes) is largely untouched.
+* **Energy-preserving lift.** A fraction of that ambience energy (set by strength)
+  is **moved** into the surround/height layer — decorrelated per channel by a
+  random-phase all-pass (unique seed each, so heights never collapse to a phantom)
+  — and **the same energy is removed from the fronts** (√-law matched). Total
+  energy is conserved: the mix never gets louder, the direct image stays intact,
+  the sound just opens up around it. Surround/height levels are therefore
+  **proportional to how diffuse the source actually is**, not forced to a fixed
+  level.
+* **Auro-Matic height tilt.** Heights get a high-frequency tilt (ceiling-reflected
+  sound reaches us with an HF emphasis).
+* **5.1 / 7.1+ sources keep every discrete channel dry**; only a gentle height
+  layer is added, derived from the front-minus-surround **phase subtraction** fed
+  through the same coherence extraction and tied to the surround level. Strength
+  scales the amount; **0 = original**.
+
+### Natural — capture the untouched source
+
+The **Natural** toggle switches off the decorrelation / matrix / phase-difference
+upmix techniques entirely and feeds the **whole, untouched source** into the same
+3D-capture engine — i.e. it renders your stereo (or surround) recording *as if it
+had been re-recorded by a 3D microphone array and reproduced*, rather than
+extracting an ambience to spread around. Pair it with **3D Reverb Environment**
+for the room. The Movie preset always uses the 3D-capture engine; Natural simply
+feeds it the full signal instead of the extracted diffuse field, and it can be
+enabled with any preset.
+
+### Strength — *Small / Medium / Large / Speech* (continued)
 
 **Options**
-* **Widening** — pushes the steered layer correlations to full independence
+* **Decorrelate** — pushes the steered layer correlations to full independence
   for the widest, most diffuse field (Small/Medium/Large carry 50 %
   decorrelation by default; Movie is fully decorrelated).
-* **3D Reverb Environment** — when on (default), reverb is the
+* **Spread reverb across nearby speakers** — when on (default), reverb is the
   60 % adjacent / 40 %-by-distance mix described above; off feeds each speaker
-  reverb from its single nearest neighbour only, for a realistic reverb behaviour.
-* **3D Immersive** *(default off)* — steers detected overhead content into the height layer, and, as it rises, **ducks the ear-level bed** — front L/R and every surround — by 2db. T
-  the duck is driven by a sustained measure of the **diffuse / ambient** energy actually present
-  — sounds like wind, storm, overhead objects like helicopters, the recording's **natural reflections**, an **ambient-music**.
-  The **centre (dialogue) and LFE are left at full level**, so voices and low end stay anchored while the
-  atmosphere lifts overhead. 
+  reverb from its single nearest neighbour only.
+* **Pure upmix — no reverb / reflections** *(default off)* — outputs **just the
+  dry spatial redistribution**: the intact bed plus the surround and height layers,
+  with **no proximity reverb, no front/centre reflection send and no LFE bloom**.
+  It is the strength-0 field forced on regardless of the strength slider (the
+  slider is greyed out while it's active). In this mode the surround/height field
+  also drops **all synthetic decorrelation** (the short all-pass that, while
+  flat, is technically a set of early reflections), so the heights carry **no
+  reflections of any kind**. For **mono / stereo** sources the surround + height
+  layer is built from the **recording's own extracted ambience** (the diffuse
+  component of the stereo image), placed at its **natural level a fair bit below
+  the front** (rather than normalised up to the front level, which made the
+  separated content too loud and harsh) — so a dry mono source keeps its
+  surrounds/heights silent, as it has no ambience to extract. Multichannel sources
+  keep their discrete surrounds/heights, just without the decorrelation — and the
+  overhead layer is built from the **direct (primary) component** of the front and
+  surround channels rather than the raw channels, so the heights don't inherit the
+  mix's baked-in surround reverb. A generated rear zone (e.g. stereo→7.1, or the
+  back pair of a 5.1→7.1.4) is given a static, reflection-free rotation so it is
+  **not identical** to the side it is derived from.
+* **Phase-difference height source** — see *How it works* step 3.
+* **Dynamics follow** *(default on)* — the synthesised field (reverb, ambience,
+  generated surrounds and heights) is reshaped so its loudness contour tracks the
+  **original mix**: where the source dips, the reverb tail is pulled down with it;
+  where it swells, the field rises. The gain is recentred to a synth-energy-
+  weighted unit mean, so the field's overall level is preserved and only its
+  *contour over time* changes — the upmix breathes with the source instead of
+  smearing it with a constant wash. The **bed stays bit-exact**; only non-bed
+  channels are touched, and only at strength > 0. `dyn_amount` (0–1) sets how far
+  it follows — the default (0.4) is a gentle nudge rather than a hard envelope
+  match.
+* **Steer atmosphere / objects to heights** *(default off)* — an internal,
+  heuristic content analyzer (no trained model) that detects **rain, wind, storm,
+  helicopters and isolated transient objects** and lifts them into the height
+  layer. It uses purely spectral / spatial cues: diffuse (low inter-channel
+  coherence) **and** noise-like (high spectral-flatness) energy for rain / wind /
+  storm; a periodic low-frequency rotor modulation (6–45 Hz, by envelope
+  modulation-spectrum) for helicopters; and for isolated objects, **brief,
+  spectrally-compact, off-centre transients** — found with an adaptive onset
+  detector (a rise above the recent level, so steady ambience never counts) gated
+  by spectral compactness (a high crest factor, so broadband wash like rain/wind
+  is excluded). Tonal, centred, correlated content (dialogue, music)
+  scores low and is left in place. The detected content drives a **time-varying,
+  level-neutral crossfade**: when overhead content is present, each height channel
+  morphs toward it; when nothing is detected the heights are untouched. Because it
+  crossfades rather than adds, the height layer still obeys the front/surround
+  average level and the bed is never touched. `steer_amount` (0–1) sets how
+  strongly the heights morph toward the detected content. *This is a creative,
+  heuristic effect — detection is approximate, so it is opt-in.*
+* **3D Immersive** *(default off)* — a separate pathway built on the analyzer
+  above. It steers detected overhead content into the height layer **and**, as it
+  rises, **ducks the ear-level bed** — front L/R and every surround — by up to
+  **`max bed duck` (default 11 dB)**. The duck is driven by a deliberately
+  **slow, sustained** measure of the **diffuse / ambient** energy actually present
+  — wind, storm, the recording's **natural reflections**, an **ambient-music**
+  wash, a helicopter's rotor wash — with a gentle multi-second attack and release,
+  so it only swells in and recedes (never fast or pumping). It **explicitly
+  ignores brief transients and dry, coherent content**: isolated object hits,
+  dialogue and dry music produce **no duck** at all. The **centre (dialogue) and
+  LFE are left at full level**, so voices and low end stay anchored while the
+  atmosphere lifts overhead. *This intentionally moves energy off the bed, so
+  unlike the other modes the bed is no longer bit-exact while it is engaged.*
 * **Dolby Pro Logic decode** — auto-detected; see below.
 
 **Dolby Pro Logic / Surround:** every stereo source is analysed for matrix
 encoding (a surround signal hidden in the out-of-phase L−R component). If found,
-the **Dolby Pro Logic decode** box auto-ticks — the stereo is decoded with the
-classic passive matrix (centre = L+R, a band-limited, Dolby-delayed, 90°
-phase-shifted R−L surround) before upmixing, and decorrelation is disabled
-(the recovered surround is a real mono signal). You can override the checkbox.
+the **Dolby Pro Logic decode** box auto-ticks. In this mode the surrounds **and**
+the heights receive *only* the content that is present on both channels but
+phase-inverted — the genuine out-of-phase matrix surround. In-phase material
+(the centre) and hard-panned material stay in the fronts/centre and are kept out
+of the surrounds, heights and their reverb, so nothing but the out-of-phase signal
+is steered overhead and behind you. The anti-phase content is also removed from
+the fronts so it does not play from the front speakers as well. The extraction is
+done per time/frequency bin, so it tracks the mix rather than dumping the whole
+L−R difference (which would also carry panned content). Decorrelation is disabled
+in this mode (the recovered surround is a single mono signal). You can override
+the checkbox.
 
 The output is a `WAVE_FORMAT_EXTENSIBLE` file with a correct `dwChannelMask`,
 so editors / receivers read the speaker assignment automatically.
@@ -106,7 +253,7 @@ python ascend_cli.py *.flac --preset Large           :: batch, auto-named
 ## How it works (the DSP, honestly)
 
 Ascend uses a single **reverb-send** engine for every preset (Small / Medium /
-Large / **Movie** / Speech), mirroring the philosophy of Upmixers like the Auro-Matic by Auro3D — keep the
+Large / **Movie** / Speech), mirroring the Auro-Matic philosophy — keep the
 original channels intact and **add** a synthesised 3D environment.
 
 **Movie is a cinema model built on measured theatre acoustics.** Its reverb
@@ -118,6 +265,24 @@ bass), and the **highs absorbed faster** (~0.85 s at 2 kHz down to ~0.55 s at
 built from a flat-summing octave-band filterbank that decays each band by its
 measured RT60.
 
+It is voiced as a **THX-style acoustically-treated auditorium**:
+
+* **Slightly lowered treble** — a gentle high-shelf rolloff on the reverb
+  (`reverb_hf_db`), modelling the absorptive wall treatment and air absorption
+  that keep a THX room from sounding bright or harsh.
+* **Absorptive rear wall** — the screen channels' reflected energy is largely
+  absorbed rather than bounced back into the seating, so the front speakers
+  contribute **less reverb to the rear/back** layer (`front_rear_absorb`).
+* **Absorptive sidewalls (to ear level)** — sidewall reflections are damped, so
+  the **side surrounds carry less reverb** (`side_absorb_db`).
+* **Room geometry → reverb timing** — the speakers sit at real cinema distances
+  (front ≈ 12 m, sides ≈ 13 m, rears ≈ 6 m, heights ≈ 11 m above), so each
+  layer's room energy arrives with a **distance-based pre-delay** (`geo_predelay`,
+  using the speed of sound): the near rears first, then the heights, fronts and
+  the far sidewalls last.
+* Early reflections are pushed past ~20 ms (cinemas suppress them; the field is
+  diffuse), and the wet field is trimmed ~3 dB at full strength. (A stricter
+  ISO 2969 / SMPTE 202M "X-curve" tail is also available in the engine.)
 
 ### The reverb-send engine
 
@@ -205,13 +370,39 @@ immersive** inputs are all accepted.
 
 When the surround/height layer is **synthesised from a mono/stereo source**, its
 summed energy is held below the front pair (a front-dominance ceiling, ~9 dB) so
-the original front never drowns as the speaker count grows — discrete
-multichannel content is never touched, and the faithful pure-ambience level
-(already well below the front) is left alone. A 7.1 source keeps its side and rear
+the original front never drowns as the speaker count grows. The same protection
+applies to **pure surround→immersive** conversions (~6 dB margin), where a
+discrete surround pair fanned across many positions plus the overhead layer would
+otherwise overpower the front. Discrete multichannel content in normal mode is
+never touched, and the faithful pure-ambience level (already well below the
+front) is left alone.
+
+On top of that, the synthesised **height** layer is levelled to match the bed:
+**all height channels** — front and rear/"surround" alike — are set to the
+**front L/R** level, so every overhead speaker is equally loud. The match is by
+loudness and is peak-capped, so a height channel is never *taller* than its
+reference even when reverb/decorrelation make it peakier. The reference excludes
+the centre, so a loud centre's dialogue/score no longer inflates the heights — and
+the centre is also kept out of the height reverb bed, so its reverb no longer
+bleeds overhead. The **centre** itself is lifted **+1.5 dB** in every mode for a
+little more dialogue presence.
+
+Both normal and **pure** (no-reverb) upmixes build the heights with the same
+**front-minus-surround phase subtraction**, done in the **time domain**
+(`height = front − pd·surround`, decorrelated) — never an STFT primary/ambient
+extraction, whose spectral smearing reads as room reflections. Pure mode is simply
+this dry source with the reverb send switched off, so the heights stay
+reflection-free yet still follow the height principle and the bed's own character
+(matching the floor channels). A continuous level band then keeps the field gliding
+with the bed instead of jumping. A 7.1 source keeps its side and rear
 surround pairs discrete for 7.1.4, or folds them at equal power for the
 single-surround Auro layouts; a 5.1 source expanding to 7.1.4 keeps its
 surrounds at the sides and generates the rear/back pair from the decorrelated
-surrounds.
+surrounds. For a **stereo (or mono) source**, where the surround field is fully
+synthesised, the ear-level surrounds are set to **half the front level (−6 dB)**
+for an enveloping upmix (multichannel sources, which have discrete surrounds, are
+unaffected). The synthesised **height** layer is always trimmed a further **−3 dB**
+below its matched reference so the overhead sits just under the ear-level layer.
 
 **Immersive (12–16 ch) inputs.** A 7.1.4 (12 ch) or 9.1.6 (16 ch) source carries
 its own discrete height channels; those are **passed through untouched** to the
