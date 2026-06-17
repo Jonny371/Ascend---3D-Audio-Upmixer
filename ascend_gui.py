@@ -6,6 +6,42 @@ Independent implementation of an Auro-Matic-style upmixer (see engine.py).
 """
 from __future__ import annotations
 import os, sys, traceback
+
+
+def _install_crash_handler():
+    """Under pythonw (the GUI launcher) there is no console, so any uncaught
+    error at startup would vanish and the window would simply never appear.
+    Capture everything: write a full traceback to ascend_error.log next to the
+    app and, if Qt is usable, pop a dialog — so a failure is never invisible."""
+    def _hook(exc_type, exc, tb):
+        msg = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            here = os.getcwd()
+        logp = os.path.join(here, "ascend_error.log")
+        try:
+            with open(logp, "w", encoding="utf-8") as f:
+                f.write(msg)
+        except Exception:
+            pass
+        try:
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(None, "Ascend — failed to start",
+                                 msg + f"\n\nThis was also saved to:\n{logp}")
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _hook
+
+
+_install_crash_handler()
+
+# Make sure the engine that ships beside this file is importable no matter what
+# the working directory is when the GUI is launched.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import numpy as np
 
 try:
@@ -22,7 +58,15 @@ from PySide6.QtWidgets import (
     QFormLayout, QFrame, QSizePolicy,
 )
 
-import engine as E
+try:
+    import engine as E
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(
+        "Could not find engine.py.\n\n"
+        "ascend_gui.py needs engine.py in the SAME folder. They ship together in "
+        "the Ascend package — make sure both files (plus requirements.txt) are in "
+        "this folder, then launch again."
+    ) from None
 
 
 # --------------------------------------------------------------------------
@@ -100,23 +144,32 @@ def load_any_audio(path, log=None):
 # --------------------------------------------------------------------------
 class Worker(QObject):
     progress = Signal(int, str)
-    finished = Signal(object, object, object)   # (matrix, mask, labels)
+    finished = Signal(object, object, object, object)   # (matrix|None, mask, labels, rms|None)
     failed = Signal(str)
 
-    def __init__(self, audio, sr, layout, preset, strength, kwargs):
+    def __init__(self, audio, sr, layout, preset, strength, kwargs, out_path, segment):
         super().__init__()
         self.audio, self.sr = audio, sr
         self.layout, self.preset, self.strength = layout, preset, strength
         self.kwargs = kwargs
+        self.out_path, self.segment = out_path, segment
 
     def run(self):
         try:
-            M, mask, labels = E.upmix(
-                self.audio, self.sr, self.layout, self.preset, self.strength,
-                progress=lambda p, m="": self.progress.emit(int(p), m),
-                **self.kwargs,
-            )
-            self.finished.emit(M, mask, labels)
+            prog = lambda p, m="": self.progress.emit(int(p), m)
+            if self.segment:
+                # Stream long files to disk in segments (bounded memory).
+                mask, labels, rms = E.upmix_segmented(
+                    self.audio, self.sr, self.layout, self.preset, self.strength,
+                    out_path=self.out_path, progress=prog, **self.kwargs,
+                )
+                self.finished.emit(None, mask, labels, rms)
+            else:
+                M, mask, labels = E.upmix(
+                    self.audio, self.sr, self.layout, self.preset, self.strength,
+                    progress=prog, **self.kwargs,
+                )
+                self.finished.emit(M, mask, labels, None)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -149,10 +202,21 @@ class Ascend(QMainWindow):
         root = QWidget(); self.setCentralWidget(root)
         outer = QVBoxLayout(root); outer.setContentsMargins(16, 14, 16, 14); outer.setSpacing(10)
 
+        header = QHBoxLayout()
         title = QLabel("ASCEND")
         title.setFont(QFont("Segoe UI", 20, QFont.Bold))
         title.setStyleSheet("color:#89b4fa; letter-spacing:4px;")
-        outer.addWidget(title)
+        header.addWidget(title)
+        header.addStretch(1)
+        self.chk_segment = QCheckBox("Low-memory mode\n(segment long files)")
+        self.chk_segment.setChecked(True)
+        self.chk_segment.setToolTip(
+            "For long files (~8–120 min): process in 6-minute segments and stream\n"
+            "each to disk, cross-fading the seams, so the upmix never runs out of\n"
+            "memory. Short files are processed normally.")
+        self.chk_segment.setStyleSheet("color:#94a3b8;")
+        header.addWidget(self.chk_segment, 0, Qt.AlignRight | Qt.AlignVCenter)
+        outer.addLayout(header)
         outer.addWidget(self._hline())
 
         # ---- input file -------------------------------------------------
@@ -179,8 +243,9 @@ class Ascend(QMainWindow):
         self.cmb_layout = QComboBox(); self.cmb_layout.addItems(list(E.LAYOUTS.keys()))
         self.cmb_layout.setCurrentText("7.1.4")
         self.cmb_preset = QComboBox(); self.cmb_preset.addItems(list(E.PRESETS.keys()))
-        self.cmb_preset.setCurrentText("Medium")
+        self.cmb_preset.setCurrentText("Movie")
         self.cmb_preset.currentTextChanged.connect(self._update_flow)
+        self.cmb_preset.currentTextChanged.connect(self._apply_opt_visibility)
         self.cmb_layout.currentTextChanged.connect(self._update_flow)
 
         self.sld = QSlider(Qt.Horizontal); self.sld.setRange(0, 16); self.sld.setValue(12)
@@ -194,46 +259,28 @@ class Ascend(QMainWindow):
         cf.addRow("Strength (0–16: dry⟶wet)", self._wrap(srow))
         outer.addWidget(ctl)
 
-        # ---- options (no reverb tuning: presets are calibrated; only the
-        #      strength above is adjustable) -------------------------------
+        # ---- options -----------------------------------------------------
+        # Most processing toggles are now fixed by the preset and hidden; the
+        # only user-facing options are Generate centre, Widening, and Pro Logic.
+        # Visibility is set per-preset in _apply_opt_visibility().
         opt = QGroupBox("Options")
         of = QVBoxLayout(opt)
         self.chk_center = QCheckBox("Generate centre from coherent signal"); self.chk_center.setChecked(True)
         self.chk_lfe    = QCheckBox("Generate LFE (low-pass sum) if absent"); self.chk_lfe.setChecked(True)
-        self.chk_noverb = QCheckBox("Pure upmix — no reverb / reflections")
-        self.chk_noverb.setChecked(False)
-
-        def _noverb_toggled(on):
-            self.sld.setEnabled(not on)
-            self.lbl_str.setEnabled(not on)
-            self._update_flow()
-        self.chk_noverb.toggled.connect(_noverb_toggled)
-        self.chk_decorr = QCheckBox("Widening"); self.chk_decorr.setChecked(False)
-        self.chk_drysur = QCheckBox("3D Reverb Environment")
-        self.chk_drysur.setChecked(True)
-        self.chk_phase = QCheckBox("Phase-difference height source")
-        self.chk_phase.setChecked(True)
-        self.chk_pl = QCheckBox("Dolby Pro Logic decode (auto-detected matrix surround)"); self.chk_pl.setChecked(False)
-        self.chk_dyn = QCheckBox("Dynamics follow")
-        self.chk_dyn.setChecked(True)
-        self.chk_steer = QCheckBox("Steer atmosphere / objects to heights")
-        self.chk_steer.setChecked(False)
-        # 3D Immersive: steer overhead content up AND duck the ear-level bed.
-        # The bed duck is fixed at 2 dB.
-        self.chk_imm = QCheckBox("3D Immersive")
-        self.chk_imm.setChecked(False)
+        self.chk_noverb = QCheckBox("Pure upmix — no reverb / reflections"); self.chk_noverb.setChecked(False)
+        self.chk_decorr = QCheckBox("Widening"); self.chk_decorr.setChecked(True)
+        self.chk_drysur = QCheckBox("3D Reverb Environment"); self.chk_drysur.setChecked(False)
+        self.chk_phase  = QCheckBox("Phase-difference height source"); self.chk_phase.setChecked(True)
+        self.chk_pl     = QCheckBox("Dolby Pro Logic decode (auto-detected matrix surround)"); self.chk_pl.setChecked(False)
+        self.chk_natural = QCheckBox("Natural (3D microphone capture of the untouched source)"); self.chk_natural.setChecked(False)
+        self.chk_dyn    = QCheckBox("Dynamics follow"); self.chk_dyn.setChecked(True)
+        self.chk_steer  = QCheckBox("Steer atmosphere / objects to heights"); self.chk_steer.setChecked(True)
+        self.chk_imm    = QCheckBox("3D Immersive"); self.chk_imm.setChecked(True)
         self.chk_pl.toggled.connect(self._pl_toggled)
-        self.chk_drysur.toggled.connect(self._update_flow)
-        self.chk_phase.toggled.connect(self._update_flow)
-        of.addWidget(self.chk_center)
-        of.addWidget(self.chk_lfe)
-        of.addWidget(self.chk_noverb)
+        # Only the user-facing options are placed in the layout.  Widening is
+        # listed first so it is the sole control shown for the Music presets.
         of.addWidget(self.chk_decorr)
-        of.addWidget(self.chk_drysur)
-        of.addWidget(self.chk_phase)
-        of.addWidget(self.chk_dyn)
-        of.addWidget(self.chk_steer)
-        of.addWidget(self.chk_imm)
+        of.addWidget(self.chk_center)
         of.addWidget(self.chk_pl)
         outer.addWidget(opt)
 
@@ -262,6 +309,7 @@ class Ascend(QMainWindow):
         self.log.setStyleSheet("background:#181825; color:#a6adc8; font-family:Consolas,monospace;")
         outer.addWidget(self.log)
         self.setStyleSheet(self._qss())
+        self._apply_opt_visibility()
 
     # ---- small helpers -------------------------------------------------
     def _hline(self):
@@ -285,6 +333,23 @@ class Ascend(QMainWindow):
         # Pro Logic supplies a real mono surround, so decorrelation is forced
         # off in that mode.
         self.chk_decorr.setEnabled(not on)
+
+    def _apply_opt_visibility(self, *a):
+        # Music presets (the reverb upmixers) expose ONLY Widening.  The
+        # immersive presets (Movie/Speech) expose Generate centre + Pro Logic;
+        # every other toggle is fixed by the preset and hidden.
+        preset = self.cmb_preset.currentText()
+        is_music = preset.startswith("Music")
+        self.chk_decorr.setVisible(is_music)
+        self.chk_center.setVisible(not is_music)
+        self.chk_pl.setVisible(not is_music)
+
+    def _natural_toggled(self, on):
+        # Natural bypasses the decorrelation / matrix / phase-difference upmix
+        # techniques, so grey them out to make that clear.
+        for w in (self.chk_decorr, self.chk_phase, self.chk_pl):
+            w.setEnabled(not on)
+        self._update_flow()
 
     def pick_input(self):
         if sf is None:
@@ -335,33 +400,21 @@ class Ascend(QMainWindow):
         preset = self.cmb_preset.currentText()
         layout = self.cmb_layout.currentText()
         s = self.sld.value()
-        morph = ("PURE UPMIX — no reverb / reflections (dry spatial field only)"
-                 if self.chk_noverb.isChecked()
-                 else "dry direct only" if s == 0
-                 else "dry + full proximity reverb" if s >= 16
-                 else f"dry + {int(round(s/16*100))}% reverb")
-        spread = self.chk_drysur.isChecked()
-        sp = ("60% adjacent / 40% rest by distance" if spread
-              else "adjacent speaker only")
-        if ch == 2:
-            t = (f"Workflow: stereo → {layout}. Bed intact; each surround + "
-                 f"height speaker = dry decorrelated direct PLUS reverb of the "
-                 f"nearest speakers ({sp}). Strength {s}/16 → {morph}.")
-        elif ch >= 6:
-            is71 = ch >= 8
-            pd = self.chk_phase.isChecked()
-            fsub = "L−Ls, R−Rs" if pd else "no subtraction"
-            rsub = (" (rear−side Ls−Lss)" if (pd and is71) else "")
-            gen = (" Rear/back zone generated from decorrelated Ls/Rs."
-                   if not is71 else "")
-            t = (f"Workflow: {ch}ch → {layout}. Discrete bed intact. "
-                 f"Each generated speaker = dry direct PLUS proximity reverb "
-                 f"({sp}): front heights' dry from front−surround ({fsub}); "
-                 f"back heights' dry from the surround{rsub}. "
-                 f"Strength {s}/16 → {morph}.{gen}")
+        src = ("stereo" if ch == 2 else f"{ch}ch" if ch >= 6 else "mono")
+        if preset.startswith("Music"):
+            wide = " + widening" if self.chk_decorr.isChecked() else ""
+            t = (f"Workflow: {src} → {layout}. {preset} reverb upmix — discrete bed "
+                 f"intact; synthesised surround/height carry the room reverb{wide}. "
+                 f"Strength {s}/16 → dry⟶wet.")
+        elif preset == "Movie":
+            t = (f"Workflow: {src} → {layout}. Energy-preserving parametric "
+                 f"redistribution: ambience extracted by coherence and moved into "
+                 f"the surround/height field (decorrelated, heights +3.7 dB HF). "
+                 f"Discrete channels kept dry; additional surrounds are diffuse, "
+                 f"not copies. Strength {s}/16 → amount lifted.")
         else:
-            t = (f"Workflow: mono → {layout} (dry direct + proximity reverb, "
-                 f"{morph}).")
+            t = (f"Workflow: {src} → {layout}. {preset} — dialogue-focused dry "
+                 f"upmix. Strength {s}/16 → dry⟶wet.")
         self.lbl_flow.setText(t)
 
     def pick_output(self):
@@ -378,23 +431,28 @@ class Ascend(QMainWindow):
             base, _ = os.path.splitext(self.in_path); self.out_path = base + "_ascend.wav"
         self.btn_run.setEnabled(False); self.bar.setValue(0)
         self.meter_box.setVisible(False)
+        preset = self.cmb_preset.currentText()
+        is_music = preset.startswith("Music")
+        is_movie = (preset == "Movie")
         kwargs = dict(
-            center_gen=self.chk_center.isChecked(),
-            gen_lfe=self.chk_lfe.isChecked(),
-            decorrelate=self.chk_decorr.isChecked(),
-            prologic=self.chk_pl.isChecked(),
-            surr_dry_lift=self.chk_drysur.isChecked(),
-            height_phase_diff=self.chk_phase.isChecked(),
-            dynamics_follow=self.chk_dyn.isChecked(),
-            steer_to_heights=self.chk_steer.isChecked(),
-            immersive_3d=self.chk_imm.isChecked(),
+            center_gen=(self.chk_center.isChecked() if not is_music else True),
+            gen_lfe=True,
+            decorrelate=(self.chk_decorr.isChecked() if is_music else True),
+            prologic=(self.chk_pl.isChecked() if not is_music else False),
+            surr_dry_lift=True,
+            height_phase_diff=True,
+            dynamics_follow=True,
+            steer_to_heights=is_movie,
+            immersive_3d=is_movie,
             immersive_duck_db=2.0,
-            no_reverb=self.chk_noverb.isChecked(),
+            no_reverb=is_movie,
+            natural=False,
             input_order=(self.cmb_order.currentText() if self.cmb_order.isEnabled() else None),
         )
         self.thread = QThread()
         self.worker = Worker(self.audio, self.sr, self.cmb_layout.currentText(),
-                             self.cmb_preset.currentText(), self.sld.value(), kwargs)
+                             self.cmb_preset.currentText(), self.sld.value(), kwargs,
+                             self.out_path, self.chk_segment.isChecked())
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_progress)
@@ -408,11 +466,15 @@ class Ascend(QMainWindow):
         if m:
             self.log_msg(f"  {p:3d}%  {m}")
 
-    def on_finished(self, M, mask, labels):
+    def on_finished(self, M, mask, labels, rms):
         try:
-            E.write_wav_extensible(self.out_path, M, self.sr, mask)
-            self.log_msg(f"Wrote {os.path.basename(self.out_path)}  ({M.shape[1]} ch, mask 0x{mask:X})")
-            self._show_meters(M, labels)
+            if M is not None:
+                E.write_wav_extensible(self.out_path, M, self.sr, mask)
+                self.log_msg(f"Wrote {os.path.basename(self.out_path)}  ({M.shape[1]} ch, mask 0x{mask:X})")
+                self._show_meters_rms(np.sqrt(np.mean(M.astype(np.float64) ** 2, axis=0)), labels)
+            else:
+                self.log_msg(f"Wrote {os.path.basename(self.out_path)}  ({len(labels)} ch, mask 0x{mask:X}) — low-memory segmented")
+                self._show_meters_rms(rms, labels)
         except Exception as e:
             self.log_msg(f"Write failed: {e}")
         self.thread.quit(); self.thread.wait()
@@ -423,11 +485,10 @@ class Ascend(QMainWindow):
         self.thread.quit(); self.thread.wait()
         self.btn_run.setEnabled(True)
 
-    def _show_meters(self, M, labels):
+    def _show_meters_rms(self, rms, labels):
         while self.meter_lay.count():
             w = self.meter_lay.takeAt(0).widget()
             if w: w.deleteLater()
-        rms = np.sqrt(np.mean(M.astype(np.float64) ** 2, axis=0))
         for lbl, r in zip(labels, rms):
             self.meter_lay.addWidget(LevelBar(lbl, float(r)))
         self.meter_box.setVisible(True)

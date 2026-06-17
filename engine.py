@@ -128,6 +128,22 @@ ORDERS_16 = {
 CINEMA_RT60 = {63: 1.35, 125: 1.25, 250: 1.12, 500: 1.05, 1000: 1.00,
                2000: 0.85, 4000: 0.70, 8000: 0.55, 16000: 0.42}
 
+# Reference control-room RT60 (the Movie / 3D-capture "room"): ~60 m2, H ~4.25 m
+# (V ~255 m3), non-parallel surfaces, ~50% of the volume given to broadband
+# LINEAR absorption.  Sabine -> RT60 ~0.28 s, and crucially it is held FLAT down
+# to the lowest octave (no bass bloom) with only the unavoidable top-octave air
+# loss — a neutral, uncoloured, fast-decaying room with a large sweet spot.
+STUDIO_RT60 = {31: 0.30, 63: 0.30, 125: 0.29, 250: 0.28, 500: 0.28, 1000: 0.28,
+               2000: 0.27, 4000: 0.26, 8000: 0.23, 16000: 0.18}
+
+# The 3D-capture "room": a neutral, open space (scoring-stage scale) rather than
+# a tight control room.  Flat ~0.5 s down to the lowest octave (no bass bloom, no
+# colouration — keeping the control room's neutrality) but long enough, together
+# with strong low-frequency decorrelation and 15-50 ms early reflections, to give
+# real ENVELOPMENT instead of an enclosed, small-room sound.
+OPEN_RT60 = {31: 0.55, 63: 0.55, 125: 0.52, 250: 0.50, 500: 0.50, 1000: 0.50,
+             2000: 0.48, 4000: 0.46, 8000: 0.42, 16000: 0.36}
+
 
 def _p(**kw):
     base = dict(predelay_ms=8, hf_decay_ratio=0.7, xover_hz=2500,
@@ -154,19 +170,19 @@ PRESETS = {
     #     air_hz is kept high (≈20 kHz) and clarity > 0 so the synthesised
     #     surrounds stay as bright as the fronts (un-muffled) with a clear early
     #     window over the LF-bloom tail, matching the reference render.
-    "Small":  _p(diffuse=1.05, length_ms=750, density=1600, decay_ms=92,
+    "Music Small":  _p(diffuse=1.05, length_ms=750, density=1600, decay_ms=92,
                  er_ms=(6, 40),  surr_gain=0.55, height_gain=0.45,
                  rear_height_gain=1.06, tilt_db=3.0, center_amt=0.60,
                  predelay_ms=4, hf_decay_ratio=0.70, xover_hz=180, surr_corr=0.55,
                  height_corr=0.20, rear_height_corr=0.70, air_hz=20000.0,
                  clarity=0.30, decorr=0.50),
-    "Medium": _p(diffuse=1.05, length_ms=800, density=1600, decay_ms=94,
+    "Music Medium": _p(diffuse=1.05, length_ms=800, density=1600, decay_ms=94,
                  er_ms=(8, 45),  surr_gain=0.52, height_gain=0.47,
                  rear_height_gain=1.10, tilt_db=2.5, center_amt=0.58,
                  predelay_ms=5, hf_decay_ratio=0.66, xover_hz=180, surr_corr=0.66,
                  height_corr=0.65, rear_height_corr=0.86, air_hz=20000.0,
                  clarity=0.30, decorr=0.50),
-    "Large":  _p(diffuse=1.05, length_ms=1200, density=1600, decay_ms=148,
+    "Music Large":  _p(diffuse=1.05, length_ms=1200, density=1600, decay_ms=148,
                  er_ms=(10, 55), surr_gain=0.44, height_gain=0.41,
                  rear_height_gain=0.89, tilt_db=2.5, center_amt=0.62,
                  predelay_ms=6, hf_decay_ratio=0.45, xover_hz=180, surr_corr=0.60,
@@ -424,6 +440,55 @@ def primary_ambient_decompose(L, R, sr, diffuse_exp=1.0, smooth_ms=50.0):
     pL, pR, aL, aR = back(ZL * pri), back(ZR * pri), back(ZL * amb), back(ZR * amb)
     n = min(len(L), len(pL), len(aL))
     return pL[:n], pR[:n], aL[:n], aR[:n]
+
+
+def _ambient_band_weight(f):
+    """Psychoacoustic / HRTF-informed weighting of how much ambience to extract
+    per frequency, independent of the coherence measurement:
+      - low frequencies (<~250 Hz): little (bass is mono/coherent, room modes —
+        extracting here only muddies and risks phantom bass in the height layer);
+      - mid / upper-mid (~300 Hz–6 kHz): full weight, where diffuse reverb energy
+        and our sense of envelopment are strongest;
+      - very high (>~9 kHz): eased off, since localisation there leans on HRTF
+        spectral cues and air absorption makes far diffuse energy scarce.
+    """
+    f = np.asarray(f, np.float64)
+    lf = 1.0 / (1.0 + (250.0 / np.maximum(f, 1.0)) ** 2.0)       # ~0 at DC -> 1 by ~250 Hz
+    hf = 1.0 / (1.0 + (np.maximum(f - 9000.0, 0.0) / 9000.0) ** 2.0)
+    return np.clip(lf * hf, 0.0, 1.0)
+
+
+def extract_ambience(L, R, sr, *, smooth_ms=45.0, coh_exp=1.6):
+    """Coherence-driven, MULTIBAND, time-varying ambience extraction.
+
+    In short STFT frames the per-bin inter-channel coherence γ(t,f) (a normalised
+    cross-correlation, 0 = decorrelated/ambient … 1 = coherent/direct) is measured
+    and the ambient gain is (1-γ)^coh_exp shaped by a psychoacoustic band weight.
+    So little is pulled where the signal is coherent (direct) or in the bass, and
+    more where it is diffuse in the mids/highs — far better than a static Side
+    signal, which would bleed direct content into the ambient bus.
+
+    Returns (aL, aR, coherence_mean, ambient_fraction).
+    """
+    L = np.asarray(L, np.float64); R = np.asarray(R, np.float64)
+    nper = 4096; hop = nper // 4; win = "hann"
+    f, t, ZL = signal.stft(L, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+    _, _, ZR = signal.stft(R, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+    a = np.exp(-hop / (sr * smooth_ms * 1e-3))
+    bsm, asm = [1 - a], [1, -a]
+    Sll = signal.lfilter(bsm, asm, np.abs(ZL) ** 2, axis=1)
+    Srr = signal.lfilter(bsm, asm, np.abs(ZR) ** 2, axis=1)
+    Slr = signal.lfilter(bsm, asm, ZL * np.conj(ZR), axis=1)
+    g = np.clip(np.abs(Slr) / (np.sqrt(Sll * Srr) + 1e-9), 0.0, 1.0)   # coherence
+    W = _ambient_band_weight(f)[:, None]
+    amb_gain = np.clip((1.0 - g) ** coh_exp, 0.0, 1.0) * W
+    def back(Z):
+        _, x = signal.istft(Z, fs=sr, window=win, nperseg=nper, noverlap=nper - hop)
+        return x
+    aL = back(ZL * amb_gain); aR = back(ZR * amb_gain)
+    n = min(len(L), len(aL))
+    coh = float(np.mean(g)); afrac = float(np.mean(amb_gain))
+    return aL[:n], aR[:n], coh, afrac
 
 
 def antiphase_common(L, R, sr, smooth_ms=40.0):
@@ -1096,13 +1161,320 @@ def prologic_decode(audio, sr):
 
 
 
+# ==========================================================================
+#  Virtual 3D microphone-array capture model  (Movie mode, v2)
+# --------------------------------------------------------------------------
+#  Treats each output channel as a microphone in a real 3D recording array and
+#  synthesises what that array would capture from the source, then reproduces
+#  it.  Grounded in how immersive/Auro-3D recordings are actually made:
+#    * height layer ~1 m ABOVE the main layer (standard 3D arrays / cube rigs)
+#      -> a ~2.9 ms inter-layer time-of-flight delay (1 m / 343 m/s);
+#    * main ambience mics spaced ~2 m (Hamasaki square) -> a few ms of
+#      front<->rear / side delay;
+#    * Perceptual Band Allocation: the HF of the diffuse field belongs UP in
+#      the height layer (the "pitch-height" effect, crossover ~0.8 kHz), the LF
+#      stays on the main layer;
+#    * vertical decorrelation is band-limited to >~0.8 kHz (decorrelating the
+#      bass vertically gives no benefit and causes phase cancellation);
+#    * the array sits beyond the critical distance, so it captures more
+#      reverberant than direct energy (the room "being-there" sound), and the
+#      height mics capture mainly reflections, not direct sound.
+# ==========================================================================
+SOUND_C = 343.0          # speed of sound, m/s
+# ORTF-3D is a NEAR-COINCIDENT array: two layers of four supercardioids in a
+# 10 x 20 cm rectangle, the height layer sitting directly on top with ZERO
+# vertical gap (vertical separation comes from capsule directivity — an X/Y
+# pair — not from spacing).  So the inter-channel delays are tiny (<0.6 ms) and
+# there is NO vertical delay.  (x = right, y = up [directivity only], z = front),
+# metres.
+CAP_POS = {
+    "L":  (-0.10, 0.0,  0.10), "R": (0.10, 0.0, 0.10), "C": (0.0, 0.0, 0.10),
+    "SL": (-0.10, 0.0, -0.10), "SR": (0.10, 0.0, -0.10),
+    "BL": (-0.10, 0.0, -0.10), "BR": (0.10, 0.0, -0.10),
+    "TFL": (-0.10, 1.0,  0.10), "TFR": (0.10, 1.0, 0.10), "TFC": (0.0, 1.0, 0.10),
+    "TSL": (-0.10, 1.0, -0.10), "TSR": (0.10, 1.0, -0.10),
+    "TBL": (-0.10, 1.0, -0.10), "TBR": (0.10, 1.0, -0.10), "TC": (0.0, 1.0, -0.10),
+}
+_FRONT_Z = 0.10
+
+
+def _cap_delay_ms(key):
+    """Near-coincident inter-mic time-of-flight (ms): only the small horizontal
+    front<->rear offset, never a vertical delay (the layers are coincident)."""
+    x, y, z = CAP_POS.get(key, (0.0, 0.0, 0.0))
+    return 1000.0 * max(0.0, (_FRONT_Z - z)) / SOUND_C      # 0 front, ~0.58 ms rear
+
+
+def analyze_soundfield(L, R, sr):
+    """Analyse the stereo field up front so the 3D capture can adapt to it.
+    Returns:
+      width   0..1  — how decorrelated the field already is (1 - |corr(L,R)|);
+                      high = a wide/ambient recording, low = mono/centred.
+      diffuse 0..1  — ambient (diffuse) energy fraction.
+      lf_mono 0..1  — low-frequency correlation (1 = mono bass).
+      crest         — peak/mean envelope (high = transient/dry, low = steady atmo).
+    These set how much diffuse energy is spread to ALL channels (incl. the
+    fronts) and how 'open' the space is rendered."""
+    L = np.asarray(L, np.float64); R = np.asarray(R, np.float64)
+    n = len(L)
+    a, b = L - L.mean(), R - R.mean()
+    corr = float(abs(np.sum(a * b) / (np.sqrt(np.sum(a * a) * np.sum(b * b)) + 1e-12)))
+    width = float(np.clip(1.0 - corr, 0.0, 1.0))
+    pL, pR, aL, aR = primary_ambient_decompose(L, R, sr, diffuse_exp=1.0)
+    m = min(len(pL), n)
+    pe = float(np.mean(pL[:m] ** 2 + pR[:m] ** 2)) + 1e-12
+    ae = float(np.mean(aL[:m] ** 2 + aR[:m] ** 2)) + 1e-12
+    diffuse = float(ae / (pe + ae))
+    sos = signal.butter(4, [40 / (sr / 2), 200 / (sr / 2)], btype="band", output="sos")
+    lo_l = signal.sosfilt(sos, L); lo_r = signal.sosfilt(sos, R)
+    lf = float(np.clip(np.sum(lo_l * lo_r) /
+                       (np.sqrt(np.sum(lo_l ** 2) * np.sum(lo_r ** 2)) + 1e-12), 0, 1))
+    seg = L[:min(n, sr * 20)]
+    env = np.abs(signal.hilbert(seg)) if len(seg) > 16 else np.abs(seg)
+    bb, aa = signal.butter(2, 20 / (sr / 2)); env = signal.lfilter(bb, aa, env)
+    crest = float(np.max(env) / (np.mean(env) + 1e-9))
+    return {"width": width, "diffuse": diffuse, "lf_mono": lf, "crest": crest}
+
+
+def _rt60_modal(x, lo, hi, sr):
+    """Blind RT60 (s) in one band: the most common free-decay slope of the
+    band-limited energy envelope.  Robust to continuous material."""
+    sos = signal.butter(4, [lo / (sr / 2), min(hi, 0.49 * sr) / (sr / 2)],
+                        btype="band", output="sos")
+    y = signal.sosfilt(sos, x)
+    bb, aa = signal.butter(2, 25 / (sr / 2))
+    e = np.maximum(signal.lfilter(bb, aa, y ** 2), 1e-12)
+    sl = np.diff(10 * np.log10(e)) * sr                     # dB/s
+    neg = sl[(sl < -1.0) & (sl > -150.0)]
+    if len(neg) < 200:
+        return None
+    h, edges = np.histogram(neg, bins=100)
+    mode = 0.5 * (edges[:-1] + edges[1:])[int(np.argmax(h))]
+    return float(-60.0 / mode) if mode < 0 else None
+
+
+def analyze_reverb(L, R, sr):
+    """Fingerprint the recording's OWN ambient reverb so it can be recreated:
+      rt60     — reverberation time (s), robust median over mid octaves,
+      drr_db   — direct-to-reverberant ratio (dB): how wet the recording is,
+      hf_damp  — how much faster the highs decay (reverb darkness, 0.4..1).
+    """
+    L = np.asarray(L, np.float64); R = np.asarray(R, np.float64)
+    mono = 0.5 * (L + R)
+    rts = [r for r in (_rt60_modal(mono, f / 1.414, f * 1.414, sr)
+                       for f in (250, 500, 1000, 2000, 4000)) if r]
+    rt60 = float(np.clip(np.median(rts), 0.25, 3.0)) if rts else 1.0
+    pL, pR, aL, aR = primary_ambient_decompose(L, R, sr, diffuse_exp=1.0)
+    m = min(len(aL), len(mono))
+    amb = 0.5 * (aL[:m] + aR[:m])
+    de = float(np.mean(0.25 * (pL[:m] + pR[:m]) ** 2)) + 1e-12
+    ae = float(np.mean(amb ** 2)) + 1e-12
+    drr_coh = 10 * np.log10(de / ae)
+    # Coherence can't see reverb in mono/near-mono material, so also estimate
+    # wetness from the envelope (how filled the quiet gaps are) and take the
+    # WETTER of the two so the reverb is never under-recreated.
+    ev = []
+    for lo, hi in ((250.0, 1000.0), (1000.0, 4000.0)):
+        sos2 = signal.butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
+        e = np.abs(signal.hilbert(signal.sosfilt(sos2, mono)))
+        e = signal.lfilter(*signal.butter(2, 30 / (sr / 2)), e); e = e[e > 1e-6]
+        if len(e) > 1000:
+            ev.append(20 * np.log10((np.percentile(e, 92) + 1e-9) / (np.percentile(e, 15) + 1e-9)))
+    drr_env = (np.clip((float(np.median(ev)) - 8.0) * 0.9, 0.0, 28.0)
+               if ev else drr_coh)
+    drr = float(np.clip(min(drr_coh, drr_env), 0.0, 30.0))
+    fa, Pa = signal.welch(amb, sr, nperseg=8192)
+    loP = float(np.mean(Pa[(fa > 200) & (fa < 1500)])) + 1e-20
+    hiP = float(np.mean(Pa[(fa > 4000) & (fa < 10000)])) + 1e-20
+    hf_damp = float(np.clip((hiP / loP) ** 0.25, 0.4, 1.0))
+    return {"rt60": rt60, "drr_db": drr, "hf_damp": hf_damp}
+
+
+def recreate_reverb_kernel(sr, fp, seed=2025):
+    """Build a reverb impulse matching the fingerprint from analyze_reverb()."""
+    rt = float(fp.get("rt60", 1.0)); hf = float(fp.get("hf_damp", 0.7))
+    curve = {31: rt * 1.05, 63: rt * 1.05, 125: rt * 1.02, 250: rt, 500: rt,
+             1000: rt, 2000: rt * max(hf, 0.85), 4000: rt * hf,
+             8000: rt * hf * 0.8, 16000: rt * hf * 0.6}
+    length_ms = float(np.clip(rt * 1000.0 * 1.1, 300.0, 1800.0))
+    k = reverb_kernel(sr, length_ms, 4200, 60.0, (8.0, 45.0), seed,
+                      predelay_ms=12.0, air_hz=18000.0, rt60_curve=curve)
+    return k / (np.sqrt(np.sum(k ** 2)) + 1e-12)            # unit energy
+
+
+def random_allpass_fir(sr, seed, length_ms=24.0, spread=0.85):
+    """A compact random-PHASE all-pass FIR.  Its magnitude response is flat (so it
+    adds no colour) but its phase is SMOOTH and random, which decorrelates a
+    signal — all the way down to low frequencies — WITHOUT the boxy, metallic,
+    small-room echo signature that a short Schroeder all-pass chain produces.
+    That smooth, echo-free decorrelation is what makes a synthesised diffuse field
+    sound open (outdoors) rather than enclosed.  Each seed is independent."""
+    N = int(max(64, round(sr * length_ms / 1000.0)))
+    nf = N // 2 + 1
+    rng = np.random.default_rng(seed)
+    gd = rng.standard_normal(nf)
+    w = max(2, nf // 40)                        # smooth the group-delay curve
+    gd = np.convolve(gd, np.ones(w) / w, mode="same")
+    gd -= gd.min(); gd /= (gd.max() + 1e-12)    # 0..1
+    gd_samp = gd * (N * spread)                  # group delay (samples)
+    dw = np.pi / (nf - 1)
+    phase = -np.cumsum(gd_samp) * dw             # integrate -> smooth phase
+    h = np.fft.irfft(np.exp(1j * phase), N)
+    return h.astype(np.float64)
+
+
+def _light_fingerprint(L, R, sr):
+    """Cheap per-window reverb fingerprint (rt60, drr_db, hf_damp) for the
+    continuous/time-varying analysis — no STFT, so it is fast to run many times."""
+    mono = 0.5 * (np.asarray(L, np.float64) + np.asarray(R, np.float64))
+    rts = [r for r in (_rt60_modal(mono, f / 1.414, f * 1.414, sr)
+                       for f in (500, 1000, 2000)) if r]
+    rt60 = float(np.clip(np.median(rts), 0.2, 3.0)) if rts else 1.0
+    ev = []
+    for lo, hi in ((250.0, 1500.0), (1500.0, 5000.0)):
+        sos = signal.butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
+        e = np.abs(signal.hilbert(signal.sosfilt(sos, mono)))
+        e = signal.lfilter(*signal.butter(2, 30 / (sr / 2)), e); e = e[e > 1e-6]
+        if len(e) > 500:
+            ev.append(20 * np.log10((np.percentile(e, 92) + 1e-9) /
+                                    (np.percentile(e, 15) + 1e-9)))
+    drr = float(np.clip((float(np.median(ev)) - 8.0) * 0.9, 0.0, 28.0)) if ev else 12.0
+    def be(lo, hi):
+        sos = signal.butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
+        return float(np.mean(signal.sosfilt(sos, mono) ** 2))
+    hf = float(np.clip((be(4000, 10000) / (be(250, 1500) + 1e-12)) ** 0.25, 0.4, 1.0))
+    return rt60, drr, hf
+
+
+def analyze_reverb_timevarying(L, R, sr, hop_s=2.0, win_s=4.0):
+    """Fingerprint the reverb CONTINUOUSLY in a sliding window, so its character
+    can change through the file (a dynamic, not static, reverb).  Returns arrays
+    t / rt60 / drr / hf."""
+    L = np.asarray(L, np.float64); R = np.asarray(R, np.float64); n = len(L)
+    hop = max(1, int(hop_s * sr)); win = int(win_s * sr)
+    t = []; rt = []; dr = []; hf = []
+    c = 0
+    while c < n:
+        a = max(0, c + hop // 2 - win // 2); b = min(n, a + win)
+        if b - a >= int(0.6 * sr):
+            r_, d_, h_ = _light_fingerprint(L[a:b], R[a:b], sr)
+            t.append((c + hop // 2) / sr); rt.append(r_); dr.append(d_); hf.append(h_)
+        c += hop
+    if not t:
+        fp = analyze_reverb(L, R, sr)
+        return {"t": np.array([0.0]), "rt60": np.array([fp["rt60"]]),
+                "drr": np.array([fp["drr_db"]]), "hf": np.array([fp["hf_damp"]])}
+    return {"t": np.array(t), "rt60": np.array(rt),
+            "drr": np.array(dr), "hf": np.array(hf)}
+
+
+def spread_reverb_field(wfL, wfR, wrL, wrR, sr, keys, seed0=4200):
+    """Decorrelate the (already time-varying, dry-relative) wet reverb fields and
+    place them per output channel.  Level is preserved (the all-pass is flat
+    magnitude), so the time-varying reverb envelope survives."""
+    n = len(wfL); out = {}
+    for i, key in enumerate(keys):
+        x, y, z = CAP_POS.get(key, (0.0, 0.0, 0.0))
+        rear = z < 0.0
+        base = (wrL if x <= 0 else wrR) if rear else (wfL if x <= 0 else wfR)
+        seed = seed0 + 17 * i + (5000 if y > 0.0 else 0)
+        h = random_allpass_fir(sr, seed, length_ms=24.0)
+        sig = conv_same(base, h)
+        sig = _delay(sig, _cap_delay_ms(key), sr)
+        sig = rbj_high_shelf(sig, sr, 6500.0, -2.0)
+        out[key] = sig[:n].astype(np.float32)
+    return out
+
+
+def movie3d_capture(L, R, sr, keys, *, natural=False,
+                    rearL=None, rearR=None, heightL=None, heightR=None, seed0=4200):
+    """Build the immersive surround + height field from the recording's OWN
+    ambience, extracted by coherence (not a synthesised reverb).
+
+    The diffuse/ambient signal is pulled out with extract_ambience() — a
+    coherence-driven, multiband, time-varying decomposition (little is taken where
+    the signal is coherent/direct or in the bass, more where it is diffuse in the
+    mids/highs).  That ambient bus is then DECORRELATED per output channel with a
+    smooth random-phase all-pass (a unique seed each, so the two height speakers
+    never collapse to a phantom but stay enveloping) and placed around/overhead.
+    Height channels get an Auro-Matic-style HF tilt (ceiling-reflected sound
+    reaches us with a high-frequency emphasis relative to the direct field).
+    Returns (out, info); the field is source-relative, to be MIXED over the
+    preserved dry channels by the caller.
+
+      natural=True       : the whole signal feeds the field (no coherence gating).
+      rearL/rearR        : a multichannel source's own surround pair, so the
+                           rear/back layer is fed by its real rear ambience.
+      heightL/heightR    : an explicit feed for the HEIGHT layer (for a surround
+                           source: a phase-subtracted-then-ambience-extracted
+                           signal); RMS-matched to the ambient level here.
+    """
+    n = len(L)
+    Lf, Rf = L.astype(np.float64), R.astype(np.float64)
+    if natural:
+        aL, aR = Lf.copy(), Rf.copy(); coh = 0.0; afrac = 1.0
+    else:
+        aL, aR, coh, afrac = extract_ambience(Lf, Rf, sr)
+    if len(aL) < n: aL = np.pad(aL, (0, n - len(aL)))
+    if len(aR) < n: aR = np.pad(aR, (0, n - len(aR)))
+    aL, aR = aL[:n], aR[:n]
+    # rear/back ambient: extracted from the source's OWN surround pair when present
+    # (already decorrelated + phase-different content), else the front ambient.
+    if rearL is not None and rearR is not None:
+        rl = np.asarray(rearL, np.float64); rr = np.asarray(rearR, np.float64)
+        if len(rl) < n: rl = np.pad(rl, (0, n - len(rl)))
+        if len(rr) < n: rr = np.pad(rr, (0, n - len(rr)))
+        if natural:
+            arL, arR = rl[:n], rr[:n]
+        else:
+            arL, arR, _, _ = extract_ambience(rl[:n], rr[:n], sr)
+            if len(arL) < n: arL = np.pad(arL, (0, n - len(arL)))
+            if len(arR) < n: arR = np.pad(arR, (0, n - len(arR)))
+            arL, arR = arL[:n], arR[:n]
+    else:
+        arL, arR = aL, aR
+
+    # explicit height feed (phase-subtracted -> ambience mix), RMS-matched to the
+    # ambient level so the existing mix gain applies uniformly.
+    hL = hR = None
+    if heightL is not None and heightR is not None:
+        hl = np.asarray(heightL, np.float64); hr = np.asarray(heightR, np.float64)
+        if len(hl) < n: hl = np.pad(hl, (0, n - len(hl)))
+        if len(hr) < n: hr = np.pad(hr, (0, n - len(hr)))
+        hl, hr = hl[:n], hr[:n]
+        amb_rms = float(np.sqrt(np.mean(aL ** 2 + aR ** 2) / 2.0)) + 1e-12
+        h_rms = float(np.sqrt(np.mean(hl ** 2 + hr ** 2) / 2.0)) + 1e-12
+        sc = amb_rms / h_rms
+        hL, hR = hl * sc, hr * sc
+
+    out = {}
+    for i, key in enumerate(keys):
+        x, y, z = CAP_POS.get(key, (0.0, 0.0, 0.0))
+        rear = z < 0.0; height = y > 0.0
+        if height and hL is not None:
+            base = hL if x <= 0 else hR
+        else:
+            base = (arL if x <= 0 else arR) if rear else (aL if x <= 0 else aR)
+        # Decorrelate (smooth random-phase all-pass, unique seed) so the diffuse
+        # field is enveloping rather than a phantom between speakers.
+        seed = seed0 + 17 * i + (5000 if height else 0)
+        h = random_allpass_fir(sr, seed, length_ms=24.0)
+        sig = conv_same(base, h)
+        sig = _delay(sig, _cap_delay_ms(key), sr)
+        if height:
+            sig = rbj_high_shelf(sig, sr, 4500.0, 3.7)       # +3.7 dB HF shelf (height tilt)
+        out[key] = sig[:n].astype(np.float32)
+    info = {"coherence": coh, "ambient_frac": afrac}
+    return out, info, aL, aR
+
+
 def upmix(audio, sr, layout_name, preset_name, strength=12, *,
           center_gen=True, gen_lfe=True, input_order=None,
           decorrelate=False, prologic=False, surr_dry_lift=True,
           height_phase_diff=True, dynamics_follow=True, dyn_amount=0.4,
           steer_to_heights=False, steer_amount=0.6,
           immersive_3d=False, immersive_duck_db=11.0, no_reverb=False,
-          overrides=None, progress=None):
+          natural=False, overrides=None, progress=None):
     def report(pp, m=""):
         if progress:
             progress(int(pp), m)
@@ -1803,6 +2175,102 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
                 and keyof.get(l) not in passthru_keys]
     gpk = lambda idx: float(np.max(np.abs(M[:, idx]))) if idx else 0.0
 
+    # === Movie / Natural: coherence-driven ambience extraction =================
+    # The surround + height field is the recording's OWN ambience, pulled out by
+    # inter-channel coherence per band over short frames (extract_ambience), then
+    # decorrelated and placed around/overhead (heights get an Auro-Matic HF tilt).
+    # The amount is intrinsic to how diffuse the source is (low coherence -> more
+    # ambience); strength scales it.  The dry of every channel is kept untouched
+    # and the ambience is MIXED on top; a multichannel source's own surrounds feed
+    # the rear/back layer (its decorrelated, phase-different content).
+    # === Movie / Natural: energy-preserving parametric redistribution ==========
+    # Inspired by the parametric time-frequency upmix idea (Turner & Murphy 2024):
+    # the surround + height field is REDISTRIBUTED from the source's own diffuse
+    # energy, not ADDED on top.  We extract the ambience by coherence, then LIFT a
+    # fraction of it (set by strength) into the surround/height layer with
+    # per-channel random-phase decorrelation, and REMOVE that same energy from the
+    # fronts — so the mix never gets louder or smeared, the direct image stays
+    # intact, and the sound just opens up around it.
+    use_capture = (preset_name == "Movie") or bool(natural)
+    if use_capture:
+        _mlev = float(np.clip(strength, 0, 16)) / 16.0
+        s_lift = _mlev * 0.5                                  # gentle: <=50% of ambience
+        L0 = L[:n].copy(); R0 = R[:n].copy()
+        rearL = rearR = None
+        if in_zones and surr_i:
+            li = [i for i in surr_i if SPK_POS.get(keyof.get(labels[i], ""), (0,))[0] <= 0]
+            ri = [i for i in surr_i if SPK_POS.get(keyof.get(labels[i], ""), (0,))[0] > 0]
+            if li: rearL = M[:, li].mean(axis=1).copy()
+            if ri: rearR = M[:, ri].mean(axis=1).copy()
+        cap_idx = list(height_i) + list(surr_i)
+        cap_keys = [keyof[labels[i]] for i in cap_idx]
+        fl_i, fr_i = idx_of({"FL"}), idx_of({"FR"})
+        # 5.1/7.1+ height feed: phase subtraction (front - surround) -> ambience,
+        # mixed 50/50; stereo heights use the front ambience.
+        heightL = heightR = None
+        if in_zones and rearL is not None and rearR is not None:
+            psL = 0.5 * (L0 - rearL[:n]); psR = 0.5 * (R0 - rearR[:n])
+            apsL, apsR, _, _ = extract_ambience(psL, psR, sr)
+            if len(apsL) < n: apsL = np.pad(apsL, (0, n - len(apsL)))
+            if len(apsR) < n: apsR = np.pad(apsR, (0, n - len(apsR)))
+            heightL = 0.5 * psL + 0.5 * apsL[:n]; heightR = 0.5 * psR + 0.5 * apsR[:n]
+        _cap, _info, aL, aR = movie3d_capture(L0, R0, sr, cap_keys + ["L", "R"],
+                                              natural=bool(natural), rearL=rearL,
+                                              rearR=rearR, heightL=heightL, heightR=heightR)
+        if callable(progress):
+            try:
+                progress(2, f"Parametric redistribution (mean coherence "
+                            f"γ≈{_info['coherence']:.2f}) — energy-preserving")
+            except Exception:
+                pass
+        # Energy-preserving redistribution.  STEREO: keep the primary in front,
+        # move a fraction s of the AMBIENCE energy out to the surround/height
+        # field and take exactly that much out of the fronts (sqrt laws so the
+        # totals match).  MULTICHANNEL: keep every discrete channel dry and only
+        # ADD a gentle height layer, tied to the surround level.
+        s = float(np.clip(s_lift, 0.0, 0.95))
+        if not in_zones:
+            left = [(i, k) for i, k in zip(cap_idx, cap_keys)
+                    if CAP_POS.get(k, (0,))[0] <= 0]
+            right = [(i, k) for i, k in zip(cap_idx, cap_keys)
+                     if CAP_POS.get(k, (0,))[0] > 0]
+            gL = np.sqrt(s / max(len(left), 1))
+            gR = np.sqrt(s / max(len(right), 1))
+            for grp, gg in ((left, gL), (right, gR)):
+                for i, key in grp:
+                    v = _cap.get(key)
+                    if v is not None:
+                        M[:, i] = gg * v[:n].astype(np.float64)
+            ff = 1.0 - np.sqrt(max(1.0 - s, 0.0))          # front ambience removed
+            for j in fl_i: M[:, j] = L0 - ff * aL[:n]
+            for j in fr_i: M[:, j] = R0 - ff * aR[:n]
+        else:
+            # MULTICHANNEL: discrete (fed) surrounds stay dry; the ADDITIONAL
+            # (non-fed, synthesised) surrounds and the heights are filled with the
+            # redistributed diffuse ambience (decorrelated) — never a copy of the
+            # discrete surround.
+            add_keys = {k for zn, (kl, kr) in out_zones.items() if not feed[zn]
+                        for k in (kl, kr)}
+            fed_i = [i for i in surr_i if keyof.get(labels[i]) not in add_keys]
+            ref_rms = (float(np.sqrt(np.mean(M[:, fed_i] ** 2))) + 1e-12 if fed_i
+                       else (float(np.sqrt(np.mean(M[:, surr_i] ** 2))) + 1e-12
+                             if surr_i else float(np.sqrt(np.mean(L0 ** 2))) + 1e-12))
+            tgt = s * 0.5 * ref_rms
+            for i, key in zip(cap_idx, cap_keys):
+                is_h = i in height_i
+                is_add = (not is_h) and (keyof.get(labels[i]) in add_keys)
+                if not (is_h or is_add):
+                    continue                                  # discrete surround stays dry
+                v = _cap.get(key)
+                if v is None:
+                    continue
+                vv = v[:n].astype(np.float64)
+                r = float(np.sqrt(np.mean(vv ** 2))) + 1e-12
+                M[:, i] = vv * (tgt / r)
+            for j in fl_i: M[:, j] = L0
+            for j in fr_i: M[:, j] = R0
+    # =========================================================================
+
     # Dynamics following: reshape the SYNTHESISED field so its macro-envelope
     # tracks the original mix (reverb/ambience breathes with the source).  Applied
     # to non-bed, non-passthrough channels only; the bed stays bit-exact.
@@ -1812,7 +2280,7 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
     if in_LFE is not None:
         bed_now.add("LFE")
     synth_i = [i for i, l in enumerate(labels) if keyof.get(l) not in bed_now]
-    if dynamics_follow and dyn_amount > 0 and synth_i and w > 0:
+    if dynamics_follow and dyn_amount > 0 and synth_i and w > 0 and not use_capture:
         dry_mono = audio[:n].mean(axis=1)
         synth_mono = M[:, synth_i].sum(axis=1)
         g = dynamics_follow_gain(dry_mono, synth_mono, sr, amount=dyn_amount)
@@ -1832,7 +2300,7 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
         ceil_db = -9.0          # synthesised field from a mono/stereo source
     elif no_reverb:
         ceil_db = -6.0          # surround → immersive, PURE: keep front clearly on top
-    if ceil_db is not None:
+    if ceil_db is not None and not use_capture:
         _excl = {"FL", "FR", "FC", "LFE", "FLW", "FRW"}
         fr_i = [i for i in range(len(labels)) if keyof.get(labels[i]) in ("FL", "FR")]
         df_i = [i for i in range(len(labels))
@@ -1883,7 +2351,7 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
     # (2) Hold the height field within a smoothly-varying band around the bed so
     #     its level glides instead of gating.  The band is wide enough that a
     #     normal (reverb) upmix — already smooth — passes through untouched.
-    if height_i and strength > 0:
+    if height_i and strength > 0 and not use_capture:
         def _slow_env(x, ms):
             aa = np.exp(-1.0 / (sr * ms * 1e-3))
             e = signal.lfilter([1 - aa], [1.0, -aa], np.abs(x).astype(np.float64))
@@ -1920,18 +2388,31 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
         if p > ref_pk > 1e-9:
             M[:, idx] *= ref_pk / p
 
-    # Front heights track the FRONT (L/R); rear/side/overhead heights track the
-    # SURROUND.  Mono/stereo source (no real surround): ALL heights track the
-    # front.  RMS reference excludes the centre, so loud dialogue/score never
-    # inflates the heights.  Applied in EVERY mode (incl. pure) so the heights are
-    # always loudness-matched to the fronts, independent of preset/strength.
+    # Front heights track the FRONT (L/R).  The rear/"surround" heights are matched
+    # to the SAME front reference so every height channel is equally loud.  RMS
+    # reference excludes the centre, so loud dialogue/score never inflates the
+    # heights.  Applied in EVERY mode (incl. pure), independent of preset/strength.
     f_rms, f_pk = _rms(lr_i), _p99(lr_i)
-    if in_zones and sur_i:
-        s_rms, s_pk = _rms(sur_i), _p99(sur_i)
-    else:
-        s_rms, s_pk = f_rms, f_pk          # stereo: heights == fronts
-    _fit(fronth_i, f_rms, f_pk)
-    _fit(rearh_i, s_rms, s_pk)
+    if not use_capture:
+        _fit(fronth_i, f_rms, f_pk)
+        _fit(rearh_i, f_rms, f_pk)
+        # Heights always sit 3 dB below their matched reference (front).
+        if height_i:
+            M[:, height_i] *= 10.0 ** (-3.0 / 20.0)
+
+    # CENTRE always +1.5 dB (all modes) for a little more dialogue presence.
+    if strength > 0:
+        c_i = idx_of({"FC"})
+        if c_i:
+            M[:, c_i] *= 10.0 ** (1.5 / 20.0)
+
+    # STEREO (/mono) CONVERSION: the surround field is fully synthesised, so set it
+    # to HALF the front level (−6 dB) for a properly enveloping upmix.  Only when
+    # the source has no discrete surround; multichannel sources are unaffected.
+    if not in_zones and surr_i and not use_capture:
+        sr_rms = _rms(surr_i)
+        if sr_rms > 1e-9 and f_rms > 1e-9:
+            M[:, surr_i] *= (0.5 * f_rms) / sr_rms
 
     # 3D IMMERSIVE: as detected content is lifted overhead, duck the EAR-LEVEL bed
     # (front L/R + every surround, synthesised or discrete) by up to
@@ -1949,6 +2430,25 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
             w_duck = np.clip(steer_duck[:n] / 0.35, 0.0, 1.0)
             gain = 10.0 ** (-(float(immersive_duck_db) / 20.0) * w_duck)
             M[:, duck_i] *= gain[:, None]
+
+    # (Movie/Natural strength is applied inside the energy-preserving
+    # redistribution block above — not re-applied here.)
+    #
+    # Field level: lift the SYNTHESISED field to taste.  Stereo (fully
+    # synthesised surround + height) +10 dB; a multichannel source's HEIGHTS and
+    # its ADDITIONAL (synthesised, non-fed) surrounds +7 dB.  Discrete fed
+    # channels are left at their dry level.
+    if use_capture:
+        if not in_zones:
+            _g = 10.0 ** (10.0 / 20.0)
+            for _i in set(surr_i) | set(height_i):
+                M[:, _i] *= _g
+        else:
+            _g = 10.0 ** (7.0 / 20.0)
+            _add = {k for zn, (kl, kr) in out_zones.items() if not feed[zn]
+                    for k in (kl, kr)}
+            for _i in set(height_i) | set(idx_of(_add)):
+                M[:, _i] *= _g
 
     # Clip protection that leaves the BED UNTOUCHED: the passthrough bed channels
     # (the discrete input that is carried through — L/R, plus C/LFE/surround bed
@@ -1969,6 +2469,14 @@ def upmix(audio, sr, layout_name, preset_name, strength=12, *,
         npk = float(np.max(np.abs(M[:, nonbed_i]))) if nonbed_i else 0.0
         if npk > 0.999:
             M[:, nonbed_i] *= 0.999 / npk
+    # Final safety: a boosted bed channel (e.g. the Movie LFE lift) must never
+    # hard-clip.  Only TRUE overs (>1.0) are touched, so any signal already at or
+    # below full scale — including the strength-0 bit-exact bed — is left exactly
+    # as it was.
+    for _i in range(len(labels)):
+        _p = float(np.max(np.abs(M[:, _i])))
+        if _p > 1.0:
+            M[:, _i] *= 0.999 / _p
     report(100, "Done")
     return M.astype(np.float32), mask, labels
 
@@ -1997,3 +2505,125 @@ def write_wav_extensible(path, data, sr, channel_mask):
         f.write(b"fmt " + struct.pack("<I", len(fmt)) + fmt)
         f.write(b"fact" + struct.pack("<I", len(fact)) + fact)
         f.write(b"data" + struct.pack("<I", len(raw)) + raw)
+
+
+def _wav_header_bytes(sr, nch, total_frames, channel_mask):
+    """Header for a float32 WAVE_FORMAT_EXTENSIBLE file whose total frame count is
+    known up front, so it can be written before the samples are streamed.  Falls
+    back to RF64 (64-bit sizes) when the data would exceed the 4 GB RIFF limit —
+    necessary for long multichannel files."""
+    bits = 32; block = nch * bits // 8; byte_rate = sr * block
+    data_size = int(total_frames) * block
+    fmt = (struct.pack("<HHIIHH", 0xFFFE, nch, sr, byte_rate, block, bits)
+           + struct.pack("<H", 22) + struct.pack("<H", bits)
+           + struct.pack("<I", channel_mask) + _SUBTYPE_FLOAT)        # 40 bytes
+    if data_size + 256 < 2 ** 32:
+        fact = struct.pack("<I", int(total_frames))
+        riff = 4 + (8 + len(fmt)) + (8 + len(fact)) + (8 + data_size)
+        return (b"RIFF" + struct.pack("<I", riff) + b"WAVE"
+                + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                + b"fact" + struct.pack("<I", len(fact)) + fact
+                + b"data" + struct.pack("<I", data_size & 0xFFFFFFFF))
+    # RF64
+    ds64_len = 28
+    fact_val = int(total_frames) if int(total_frames) < 2 ** 32 else 0xFFFFFFFF
+    fact = struct.pack("<I", fact_val)
+    riff_size = (4 + (8 + ds64_len) + (8 + len(fmt))
+                 + (8 + len(fact)) + 8 + data_size)
+    ds64 = struct.pack("<QQQI", riff_size, data_size, int(total_frames), 0)
+    return (b"RF64" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+            + b"ds64" + struct.pack("<I", len(ds64)) + ds64
+            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"fact" + struct.pack("<I", len(fact)) + fact
+            + b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+def upmix_segmented(audio, sr, layout_name, preset_name, strength=12, *,
+                    out_path=None, seg_minutes=6.0, overlap_s=4.0,
+                    progress=None, **kwargs):
+    """Memory-bounded upmix for long files (≈8–120 min).  Processes the input in
+    `seg_minutes` segments and streams each one straight to `out_path`, so peak RAM
+    is set by one segment, not the whole file.  Adjacent segments overlap by
+    `overlap_s` and are cross-faded (equal-power for the synthesised/decorrelated
+    channels, linear for the coherent bed — auto-detected per channel) so the seams
+    are inaudible and the passthrough bed stays sample-accurate.  The overlap also
+    pre-warms each segment's reverb/decorrelation state before it reaches full
+    level.  Returns (channel_mask, labels, per-channel RMS) — the file is written
+    directly, never held whole in memory."""
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim == 1:
+        audio = audio[:, None]
+    n = audio.shape[0]
+    hop = int(round(seg_minutes * 60 * sr))
+    xf = max(1, int(round(overlap_s * sr)))
+
+    # Short enough to do in one pass.
+    if n <= hop + xf or hop <= xf:
+        M, mask, labels = upmix(audio, sr, layout_name, preset_name, strength,
+                                progress=progress, **kwargs)
+        if out_path is not None:
+            write_wav_extensible(out_path, M, sr, mask)
+        rms = np.sqrt(np.mean(M.astype(np.float64) ** 2, axis=0))
+        return mask, labels, rms
+
+    starts = list(range(0, n, hop))
+    nseg = len(starts)
+    fh = None; mask = None; labels = None; nch = None
+    ss = None; written = 0; carry = None
+
+    for si, s0 in enumerate(starts):
+        a0 = max(0, s0 - xf); a1 = min(n, s0 + hop)
+        L = a1 - a0
+        last = (a1 >= n)
+
+        def _sp(p, m="", _i=si):
+            if progress:
+                progress(int((_i + p / 100.0) / nseg * 100),
+                         m or f"segment {_i + 1}/{nseg}")
+        M, mask, labels = upmix(audio[a0:a1], sr, layout_name, preset_name,
+                                strength, progress=_sp, **kwargs)
+        M = M[:L]
+        if fh is None:
+            nch = M.shape[1]; ss = np.zeros(nch, np.float64)
+            if out_path is not None:
+                fh = open(out_path, "wb")
+                fh.write(_wav_header_bytes(sr, nch, n, mask))
+
+        def _w(block):
+            nonlocal written
+            if block.shape[0] == 0:
+                return
+            if fh is not None:
+                fh.write(np.ascontiguousarray(block.astype("<f4")).tobytes())
+            ss[:] += np.sum(block.astype(np.float64) ** 2, axis=0)
+            written += block.shape[0]
+
+        if si == 0:
+            if last:
+                _w(M); carry = None
+            else:
+                _w(M[:L - xf]); carry = M[L - xf:].copy()
+        else:
+            xa = min(xf, L, carry.shape[0])
+            prev_tail = carry[-xa:]; head = M[:xa]
+            # Per channel: coherent (bed / deterministic) → linear cross-fade so it
+            # stays sample-exact; otherwise (decorrelated/reverb) → equal-power so
+            # the level doesn't dip through the blend.
+            d = np.sqrt(np.mean((prev_tail - head) ** 2, axis=0))
+            s = np.sqrt(np.mean(prev_tail ** 2, axis=0)) + 1e-9
+            coh = (d / s) < 0.05
+            t = np.linspace(0.0, 1.0, xa, endpoint=False)
+            fo = np.where(coh[None, :], (1.0 - t)[:, None],
+                          np.cos(t * np.pi / 2)[:, None]).astype(np.float64)
+            fi = np.where(coh[None, :], t[:, None],
+                          np.sin(t * np.pi / 2)[:, None]).astype(np.float64)
+            _w(fo * prev_tail + fi * head)
+            if last:
+                _w(M[xa:]); carry = None
+            else:
+                _w(M[xa:L - xf]); carry = M[L - xf:].copy()
+
+    if fh is not None:
+        fh.close()
+    rms = np.sqrt(ss / max(1, written))
+    return mask, labels, rms
